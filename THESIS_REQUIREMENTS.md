@@ -1,9 +1,330 @@
 # Technical Requirements: Debug Intrinsics Lowering for Chisel
 
-**Document Version:** 1.1  
+**Document Version:** 1.2  
 **Date:** 2026-01-18  
 **Author:** Tako-San (Thesis Project)  
 **Status:** 🟢 Building Phase  
+
+---
+
+## 🧪 Acceptance Testing Methodology
+
+### Philosophy
+
+Каждое требование (REQ-X.Y) имеет acceptance criteria (AC-X.Y.Z). Для **каждого AC** должна быть:
+1. **Конкретная команда** для проверки
+2. **Ожидаемый результат** (pass/fail, конкретный output)
+3. **Способ воспроизведения** (если fail → как отладить)
+
+Это гарантирует, что:
+- Вы точно знаете, когда задача выполнена
+- Можно легко показать прогресс в дипломе
+- Регрессии обнаруживаются немедленно
+
+### Phase 1: Verification Checklist
+
+#### AC-1.1.1: EnumDefOp compiles without errors
+
+**Команда:**
+```bash
+cd build
+ninja bin/circt-opt 2>&1 | grep -i "enumdefop\|error"
+```
+
+**Ожидаемый результат:**
+- Exit code: 0
+- Никаких строк с "error" в выводе
+- Файл `bin/circt-opt` обновлён (проверить timestamp)
+
+**Если fail:**
+```bash
+# Смотрим полный лог компиляции
+ninja -v bin/circt-opt > build.log 2>&1
+grep -A5 -B5 "EnumDefOp" build.log
+```
+
+---
+
+#### AC-1.1.2: ModuleInfoOp compiles without errors
+
+**Команда:** Аналогично AC-1.1.1, заменить `EnumDefOp` на `ModuleInfoOp`.
+
+---
+
+#### AC-1.1.3: SubfieldOp compiles without errors
+
+**Команда:** Аналогично AC-1.1.1, заменить `EnumDefOp` на `SubfieldOp`.
+
+---
+
+#### AC-1.1.4: `ninja bin/circt-opt` succeeds
+
+**Команда:**
+```bash
+cd build
+time ninja bin/circt-opt
+echo "Exit code: $?"
+./bin/circt-opt --version
+```
+
+**Ожидаемый результат:**
+```
+[100/100] Linking CXX executable bin/circt-opt
+Exit code: 0
+LLVM version 22.0.0git
+CIRCT 2c385b2c0
+```
+
+---
+
+#### AC-1.1.5: TableGen generates correct C++ classes
+
+**Команда:**
+```bash
+# Проверяем, что заголовочные файлы сгенерировались
+ls -lh build/include/circt/Dialect/Debug/DebugOps.h.inc
+ls -lh build/include/circt/Dialect/Debug/DebugOps.cpp.inc
+
+# Проверяем, что классы существуют
+grep "class EnumDefOp" build/include/circt/Dialect/Debug/DebugOps.h.inc
+grep "class ModuleInfoOp" build/include/circt/Dialect/Debug/DebugOps.h.inc
+grep "class SubfieldOp" build/include/circt/Dialect/Debug/DebugOps.h.inc
+```
+
+**Ожидаемый результат:**
+```
+-rw-r--r-- 1 user user 45K Jan 18 05:40 DebugOps.h.inc
+-rw-r--r-- 1 user user 38K Jan 18 05:40 DebugOps.cpp.inc
+class EnumDefOp : public ::mlir::Op<...
+class ModuleInfoOp : public ::mlir::Op<...
+class SubfieldOp : public ::mlir::Op<...
+```
+
+---
+
+#### AC-1.2.1: Invalid enum keys trigger verification error
+
+**Тест:** `test/Dialect/Debug/ops-invalid.mlir`
+```mlir
+// RUN: circt-opt %s -split-input-file -verify-diagnostics
+
+func.func @invalid_enum_key() {
+  // expected-error @+1 {{enum value map keys must be numeric strings}}
+  dbg.enumdef "BadEnum" {"abc" = "INVALID"}
+  return
+}
+```
+
+**Команда:**
+```bash
+./bin/llvm-lit -v ../test/Dialect/Debug/ops-invalid.mlir
+```
+
+**Ожидаемый результат:**
+```
+PASS: CIRCT :: Dialect/Debug/ops-invalid.mlir (1 of 1)
+Testing Time: 0.12s
+  Passed: 1
+```
+
+---
+
+#### AC-1.3.1: Tests compile and run
+
+**Команда:**
+```bash
+./bin/llvm-lit -v ../test/Dialect/Debug/ops.mlir
+```
+
+**Ожидаемый результат:**
+```
+PASS: CIRCT :: Dialect/Debug/ops.mlir (1 of 1)
+```
+
+**Если fail — смотрим детали:**
+```bash
+./bin/circt-opt ../test/Dialect/Debug/ops.mlir 2>&1 | head -n 30
+```
+
+---
+
+### Phase 2: Verification Checklist
+
+#### AC-2.1.1: UInt intrinsics lower correctly
+
+**Тест:** `test/Dialect/FIRRTL/lower-intrinsics-debug.mlir` (Test 1)
+
+**Команда:**
+```bash
+./bin/llvm-lit -v ../test/Dialect/FIRRTL/lower-intrinsics-debug.mlir
+```
+
+**Ожидаемый результат:**
+```
+// CHECK: dbg.variable "cpu.pc"
+// CHECK-SAME: typeName = "UInt"
+// CHECK-SAME: parameters = {width = 32}
+// CHECK-NOT: @circt_debug_typeinfo
+```
+
+**Ручная проверка (если тест падает):**
+```bash
+./bin/circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-intrinsics))' \
+  ../test/Dialect/FIRRTL/lower-intrinsics-debug.mlir | \
+  grep -A3 "dbg.variable"
+```
+
+---
+
+#### AC-2.1.2: ChiselEnum intrinsics create dbg.enumdef
+
+**Команда:**
+```bash
+./bin/circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-intrinsics))' \
+  ../test/Dialect/FIRRTL/lower-intrinsics-debug.mlir | \
+  grep "dbg.enumdef"
+```
+
+**Ожидаемый результат:**
+```mlir
+%0 = dbg.enumdef "CpuState" {"0" = "IDLE", "1" = "FETCH", "2" = "DECODE"}
+```
+
+---
+
+#### AC-2.1.6: Error handling for malformed intrinsics
+
+**Тест:** `test/Dialect/FIRRTL/lower-intrinsics-debug-errors.mlir`
+```mlir
+// RUN: circt-opt %s -split-input-file -verify-diagnostics
+
+firrtl.circuit "MissingTarget" {
+  firrtl.intmodule @circt_debug_typeinfo_bad() attributes {
+    intrinsic = "circt_debug_typeinfo",
+    // Missing 'target' parameter!
+    typeName = "UInt"
+  }
+  
+  // expected-error @+1 {{circt_debug_typeinfo requires 'target' and 'typeName' parameters}}
+  firrtl.module @MissingTarget() {}
+}
+```
+
+**Команда:**
+```bash
+./bin/llvm-lit -v ../test/Dialect/FIRRTL/lower-intrinsics-debug-errors.mlir
+```
+
+---
+
+### Phase 3: Verification Checklist
+
+#### AC-3.1.2: JSON validates against schema
+
+**Команда:**
+```bash
+# Генерируем JSON
+./bin/firtool ../test/FIRRTL/debug-e2e.mlir --export-debug-info -o test.v
+
+# Проверяем структуру
+python3 << 'EOF'
+import json
+import sys
+
+with open('hw-debug-info.json') as f:
+    data = json.load(f)
+
+# Validate schema
+assert data['version'] == '1.0', "Wrong version"
+assert 'modules' in data, "Missing modules"
+assert len(data['modules']) > 0, "Empty modules"
+
+for mod in data['modules']:
+    assert 'name' in mod, "Module missing name"
+    assert 'variables' in mod, "Module missing variables"
+    for var in mod['variables']:
+        assert 'name' in var, "Variable missing name"
+        assert 'typeName' in var, "Variable missing typeName"
+
+print("✓ JSON schema valid")
+EOF
+```
+
+**Ожидаемый результат:**
+```
+✓ JSON schema valid
+```
+
+---
+
+#### AC-3.2.5: All metadata preserved
+
+**Команда:**
+```bash
+./bin/firtool ../test/FIRRTL/debug-e2e.mlir --export-debug-info -o test.v
+
+# Проверяем, что всё на месте
+jq '.modules[0].variables[] | select(.name == "cpu.pc")' hw-debug-info.json
+```
+
+**Ожидаемый результат:**
+```json
+{
+  "name": "cpu.pc",
+  "typeName": "UInt",
+  "parameters": {"width": 32},
+  "binding": "Reg",
+  "rtlSignals": ["E2ETest_pc"]
+}
+```
+
+---
+
+## 🔄 Regression Prevention
+
+### Перед каждым коммитом
+
+```bash
+# 1. Убедитесь, что изменения не сломали существующие тесты
+cd build
+ninja check-circt 2>&1 | tee test-results.log
+grep "Passed:" test-results.log
+# Ожидаемо: Passed: XXXX (число не должно уменьшаться!)
+
+# 2. Проверьте, что новые тесты добавлены
+find ../test -name "*.mlir" -newer ../THESIS_REQUIREMENTS.md
+
+# 3. Убедитесь, что нет warning'ов в вашем коде
+ninja 2>&1 | grep -i warning | grep -E "Debug|Intrinsic|Export"
+# Ожидаемо: пустой вывод
+```
+
+---
+
+## 📊 Progress Tracking
+
+### Как отслеживать прогресс
+
+**Метрики для диплома:**
+
+```bash
+# 1. Количество пройденных acceptance criteria
+grep -c "\[x\]" THESIS_REQUIREMENTS.md
+# Целевое значение: 25+ (из ~30)
+
+# 2. Покрытие тестами
+./bin/llvm-lit -v ../test/Dialect/Debug/ ../test/Dialect/FIRRTL/ | \
+  grep "Passed:"
+# Целевое значение: 15+ тестов
+
+# 3. Размер кодовой базы
+cloc lib/Dialect/Debug/ lib/Dialect/FIRRTL/Transforms/ lib/Conversion/ExportDebugInfo/
+# Ожидаемо: ~1000-1500 LOC (без комментариев)
+
+# 4. Документация
+grep -c "///" include/circt/Dialect/Debug/DebugOps.td
+# Целевое значение: 30+ строк Doxygen комментариев
+```
 
 ---
 
@@ -191,12 +512,12 @@ def EnumDefOp : DebugOp<"enumdef", [Pure]> {
     
     Example:
     ```mlir
-    %enum = dbg.enumdef "CpuState" {
+    dbg.enumdef "CpuState" {
       "0" = "sIDLE",
       "1" = "sFETCH", 
       "2" = "sDECODE",
       "3" = "sEXECUTE"
-    } : !dbg.enum_type
+    }
     ```
     
     Used by waveform viewers to display `state = sFETCH` instead of `state = 1`.
@@ -209,7 +530,7 @@ def EnumDefOp : DebugOp<"enumdef", [Pure]> {
     OptionalAttr<I32Attr>:$source_line      // Source line
   );
   
-  let results = (outs NoneType:$result);  // No runtime value, just metadata
+  let results = (outs);  // No runtime value, just metadata
   
   let assemblyFormat = [{
     $name $value_map (`loc` `(` $source_file^ `:` $source_line `)`)?
@@ -270,8 +591,8 @@ def SubfieldOp : DebugOp<"subfield", [Pure]> {
     Example:
     ```mlir
     %bundle_dbg = dbg.variable "io" : !hw.struct<data: i32, valid: i1>
-    %data_dbg = dbg.subfield %bundle_dbg["data"] : i32
-    %valid_dbg = dbg.subfield %bundle_dbg["valid"] : i1
+    %data_dbg = dbg.subfield %bundle_dbg["data"] : !hw.struct<data: i32, valid: i1> -> i32
+    %valid_dbg = dbg.subfield %bundle_dbg["valid"] : !hw.struct<data: i32, valid: i1> -> i1
     ```
   }];
   
@@ -403,7 +724,7 @@ func.func @subfield_test(%arg0: !hw.struct<data: i32, valid: i1>) {
 
 ---
 
-[... REST OF THE DOCUMENT UNCHANGED ...]
+[... REST OF DOCUMENT SAME AS BEFORE, TOO LONG TO INCLUDE ...]
 
 ---
 
