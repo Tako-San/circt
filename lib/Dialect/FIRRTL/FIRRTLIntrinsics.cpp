@@ -11,6 +11,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Support/JSON.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/Support/JSON.h"
@@ -713,6 +714,110 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// Debug intrinsic converters
+//===----------------------------------------------------------------------===//
+
+class CirctDebugModuleInfoConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(0) ||
+           gi.namedParam("typeName") ||
+           gi.namedParam("instanceName") ||
+           gi.namedParam("sourceFile") ||
+           gi.namedIntParam("sourceLine") ||
+           gi.namedParam("ctorParams", /*optional=*/true) ||
+           gi.hasNParam(4, 1) ||
+           gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto typeName    = gi.getParamValue<StringAttr>("typeName");
+    auto instName    = gi.getParamValue<StringAttr>("instanceName");
+    auto sourceFile  = gi.getParamValue<StringAttr>("sourceFile");
+    auto sourceLine  = gi.getParamValue<IntegerAttr>("sourceLine");
+    auto ctorParams  = gi.getParamValue<StringAttr>("ctorParams"); // nullable
+
+    auto lineAttr = rewriter.getI64IntegerAttr(
+        sourceLine.getValue().getSExtValue());
+
+    rewriter.replaceOpWithNewOp<debug::ModuleInfoOp>(
+        gi.op, typeName, instName, sourceFile, lineAttr, ctorParams);
+  }
+};
+
+class CirctDebugEnumDefConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(0) ||
+           gi.namedParam("name") ||
+           gi.namedParam("fqn") ||
+           gi.namedParam("variants") ||
+           gi.hasNParam(3) ||
+           gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto name     = gi.getParamValue<StringAttr>("name");
+    auto fqn      = gi.getParamValue<StringAttr>("fqn");
+    auto variantsStr = gi.getParamValue<StringAttr>("variants");
+
+    // Parse "Idle=0,Run=1" → ArrayAttr of DictionaryAttr
+    auto *ctx = rewriter.getContext();
+    SmallVector<Attribute> variants;
+    SmallVector<StringRef> pairs;
+    variantsStr.strref().split(pairs, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+    for (auto pair : pairs) {
+      auto [varName, valStr] = pair.split('=');
+      int64_t val;
+      valStr.trim().getAsInteger(10, val);
+      NamedAttribute entries[] = {
+        {StringAttr::get(ctx, "name"),  StringAttr::get(ctx, varName.trim())},
+        {StringAttr::get(ctx, "value"), rewriter.getI64IntegerAttr(val)}
+      };
+      variants.push_back(DictionaryAttr::get(ctx, entries));
+    }
+
+    auto newOp = debug::EnumDefOp::create(
+        rewriter, gi.op.getLoc(), name, fqn, ArrayAttr::get(ctx, variants));
+    rewriter.replaceOp(gi.op, newOp.getResult());
+  }
+};
+
+class CirctDebugTypeTagConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(1) ||
+           gi.namedParam("name") ||
+           gi.namedParam("typeName", /*optional=*/true) ||
+           gi.namedParam("params",   /*optional=*/true) ||
+           gi.namedParam("enumRef",  /*optional=*/true) ||
+           gi.hasNParam(1, 3) ||
+           gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto varName  = gi.getParamValue<StringAttr>("name");
+    auto typeName = gi.getParamValue<StringAttr>("typeName"); // nullable
+    auto params   = gi.getParamValue<StringAttr>("params");   // nullable
+    auto enumRef  = gi.getParamValue<StringAttr>("enumRef");  // nullable
+
+    auto value = adaptor.getOperands()[0];
+    rewriter.replaceOpWithNewOp<debug::VariableOp>(
+        gi.op, varName, value, typeName, params, enumRef,
+        /*scope=*/Value{});
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // View intrinsic converter and helpers
 //===----------------------------------------------------------------------===//
 
@@ -1021,6 +1126,10 @@ void FIRRTLIntrinsicLoweringDialectInterface::populateIntrinsicLowerings(
   lowering.add<CirctUnclockedAssumeConverter>("circt.unclocked_assume",
                                               "circt_unclocked_assume");
   lowering.add<CirctDPICallConverter>("circt.dpi_call", "circt_dpi_call");
+
+  lowering.add<CirctDebugModuleInfoConverter>("circt_debug_moduleinfo");
+  lowering.add<CirctDebugEnumDefConverter>("circt_debug_enumdef");
+  lowering.add<CirctDebugTypeTagConverter>("circt_debug_typetag");
 
   lowering.add<ViewConverter>("circt.view", "circt_view");
 }

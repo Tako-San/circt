@@ -71,10 +71,75 @@ def VariableOp : DebugOp<"variable"> {
   let arguments = (ins
     StrAttr:$name,
     AnyType:$value,
+    OptionalAttr<StrAttr>:$typeName,
+    OptionalAttr<StrAttr>:$params,
+    OptionalAttr<StrAttr>:$enumRef,
     Optional<ScopeType>:$scope
   );
   let assemblyFormat = [{
     $name `,` $value (`scope` $scope^)? attr-dict `:` type($value)
+  }];
+}
+
+
+def SubFieldOp : DebugOp<"subfield", [Pure]> {
+  let summary = "A named subfield of an aggregate to be captured in debug info";
+  let description = [{
+    Like `dbg.variable` but represents a single named field within a Bundle
+    or Vec aggregate. Returns a `!dbg.subfield` value consumed by `dbg.struct`
+    or `dbg.array`. Has no `scope` operand — scope is inherited from the
+    enclosing `dbg.variable`.
+  }];
+  let arguments = (ins
+    StrAttr:$name,
+    AnyType:$value,
+    OptionalAttr<StrAttr>:$typeName,
+    OptionalAttr<StrAttr>:$params,
+    EnumDefType:$enumDef
+  );
+  let results = (outs SubFieldType:$result);
+  let hasCustomAssemblyFormat = 1;
+}
+
+
+def EnumDefOp : DebugOp<"enumdef", [Pure]> {
+  let summary = "Define the named variants of a source-language enumeration";
+  let description = [{
+    Declares a ChiselEnum by name and ordered list of variants. Each variant
+    is a DictionaryAttr with keys `name` (StringAttr) and `value`
+    (IntegerAttr i64). Emitted once per distinct enum type per module by the
+    intrinsic lowering pass. No `id` field — SSA dominance guarantees
+    uniqueness.
+  }];
+  let arguments = (ins
+    StrAttr:$name,
+    StrAttr:$fqn,
+    ArrayAttr:$variants
+  );
+  let results = (outs EnumDefType:$result);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
+
+def ModuleInfoOp : DebugOp<"moduleinfo"> {
+  let summary = "Source-language class name and location for the enclosing module";
+  let description = [{
+    Emitted once per hardware module by the intrinsic lowering pass. Carries
+    the Chisel class name, instance name, source location and optional
+    constructor parameters. Consumed by the hw-debug-info export pass.
+  }];
+  let arguments = (ins
+    StrAttr:$typeName,
+    StrAttr:$instanceName,
+    StrAttr:$sourceFile,
+    SI64Attr:$sourceLine,
+    OptionalAttr<StrAttr>:$ctorParams
+  );
+  let assemblyFormat = [{
+    $typeName `,` $instanceName `,` $sourceFile `:` $sourceLine
+    (`params` $ctorParams^)?
+    attr-dict
   }];
 }
 

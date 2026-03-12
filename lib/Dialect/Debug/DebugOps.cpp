@@ -115,6 +115,160 @@ void ArrayOp::print(OpAsmPrinter &printer) {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Common helper for SubFieldOp
+//===----------------------------------------------------------------------===//
+
+// Parses: $name, $value, (enum $enumDef)?, attrs, : type($value)
+static ParseResult parseVarLike(
+    OpAsmParser &parser, OperationState &result,
+    OpAsmParser::UnresolvedOperand &valueOperand,
+    std::optional<OpAsmParser::UnresolvedOperand> &enumOperand) {
+
+  // name
+  StringAttr nameAttr;
+  if (parser.parseAttribute(nameAttr, "name", result.attributes))
+    return failure();
+  if (parser.parseComma())
+    return failure();
+
+  // value
+  if (parser.parseOperand(valueOperand))
+    return failure();
+
+  // (enum $enumDef)?
+  if (succeeded(parser.parseOptionalKeyword("enum"))) {
+    OpAsmParser::UnresolvedOperand enumOp;
+    if (parser.parseOperand(enumOp))
+      return failure();
+    enumOperand = enumOp;
+  }
+
+  // optional attrs (typeName, params)
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // : type($value)
+  Type valueType;
+  if (parser.parseColon() || parser.parseType(valueType))
+    return failure();
+  if (parser.resolveOperand(valueOperand, valueType, result.operands))
+    return failure();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SubFieldOp
+//===----------------------------------------------------------------------===//
+
+ParseResult SubFieldOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand valueOperand;
+  std::optional<OpAsmParser::UnresolvedOperand> enumOperand;
+
+  if (parseVarLike(parser, result, valueOperand, enumOperand))
+    return failure();
+
+  auto *ctx = parser.getContext();
+  if (enumOperand)
+    if (parser.resolveOperand(*enumOperand, EnumDefType::get(ctx),
+                              result.operands))
+      return failure();
+
+  result.addAttribute("operand_segment_sizes",
+    parser.getBuilder().getDenseI32ArrayAttr(
+      {1, enumOperand ? 1 : 0}));
+  result.addTypes(SubFieldType::get(ctx));
+  return success();
+}
+
+void SubFieldOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printAttribute(getNameAttr());
+  p << ", ";
+  p.printOperand(getValue());
+  if (auto enumDef = getEnumDef()) {
+    p << " enum ";
+    p.printOperand(enumDef);
+  }
+  p.printOptionalAttrDict(getOperation()->getAttrs(),
+    {"name", "operand_segment_sizes"});
+  p << " : ";
+  p.printType(getValue().getType());
+}
+
+//===----------------------------------------------------------------------===//
+// EnumDefOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult EnumDefOp::verify() {
+  for (auto attr : getVariants()) {
+    auto dict = dyn_cast<DictionaryAttr>(attr);
+    if (!dict)
+      return emitOpError("each element of 'variants' must be a DictionaryAttr");
+    if (!dict.get("name") || !isa<StringAttr>(dict.get("name")))
+      return emitOpError("variant missing 'name' StringAttr");
+    if (!dict.get("value") || !isa<IntegerAttr>(dict.get("value")))
+      return emitOpError("variant missing 'value' IntegerAttr");
+  }
+  return success();
+}
+
+ParseResult EnumDefOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto *ctx = parser.getContext();
+
+  StringAttr nameAttr, fqnAttr;
+  if (parser.parseAttribute(nameAttr, "name", result.attributes))
+    return failure();
+  if (parser.parseKeyword("fqn") || parser.parseAttribute(fqnAttr))
+    return failure();
+  result.addAttribute("fqn", fqnAttr);
+
+  SmallVector<Attribute> variants;
+  auto parseVariant = [&]() -> ParseResult {
+    StringRef varName;
+    if (parser.parseKeyword(&varName) || parser.parseEqual())
+      return failure();
+    Attribute valueAttr;
+    if (parser.parseAttribute(valueAttr))
+      return failure();
+    NamedAttribute entries[] = {
+      {StringAttr::get(ctx, "name"), StringAttr::get(ctx, varName)},
+      {StringAttr::get(ctx, "value"), valueAttr}
+    };
+    variants.push_back(DictionaryAttr::get(ctx, entries));
+    return success();
+  };
+  if (parser.parseCommaSeparatedList(AsmParser::Delimiter::Braces,
+                                     parseVariant))
+    return failure();
+
+  // Add variants before parseOptionalAttrDict to avoid duplication
+  result.addAttribute("variants", ArrayAttr::get(ctx, variants));
+  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return failure();
+
+  result.addTypes(EnumDefType::get(ctx));
+  return success();
+}
+
+void EnumDefOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printAttribute(getNameAttr());
+  p << " fqn ";
+  p.printAttribute(getFqnAttr());
+  p << " {";
+  llvm::interleaveComma(getVariants(), p.getStream(), [&](Attribute attr) {
+    auto dict = cast<DictionaryAttr>(attr);
+    p << cast<StringAttr>(dict.get("name")).getValue();
+    p << " = ";
+    p.printAttribute(dict.get("value"));
+  });
+  p << '}';
+  p.printOptionalAttrDictWithKeyword(getOperation()->getAttrs(),
+                                     {"name", "fqn", "variants"});
+}
+
 // Operation implementations generated from `Debug.td`
 #define GET_OP_CLASSES
 #include "circt/Dialect/Debug/Debug.cpp.inc"
