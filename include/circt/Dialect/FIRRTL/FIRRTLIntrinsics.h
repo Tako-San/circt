@@ -263,6 +263,15 @@ public:
     (addConverter<T>(args), ...);
   }
 
+  /// Registers a converter with constructor arguments.
+  template <typename T, typename... Args>
+  void addConverter(StringRef name, Args... args) {
+    auto nameAttr = StringAttr::get(context, name);
+    assert(!conversions.contains(nameAttr) &&
+           "duplicate conversion for intrinsic");
+    conversions.try_emplace(nameAttr, std::make_unique<T>(args...));
+  }
+
   /// Lowers all intrinsics in a module.  Returns number converted or failure.
   FailureOr<size_t> lower(FModuleOp mod, bool allowUnknownIntrinsics = false);
 

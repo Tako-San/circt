@@ -32,4 +32,20 @@ def ArrayType : DebugTypeDef<"Array"> {
   let description = "The result of a `dbg.array` operation.";
 }
 
+def SubFieldType : DebugTypeDef<"SubField"> {
+  let mnemonic = "subfield";
+  let summary = "debug variable subfield of an aggregate";
+  let description = "The result of a `dbg.subfield` operation.";
+}
+
+def EnumDefType : DebugTypeDef<"EnumDef"> {
+  let mnemonic = "enumdef";
+  let summary = "SSA value representing a dbg.enumdef declaration";
+  let description = [{
+    Produced by `dbg.enumdef`. Used as operand in `dbg.variable` and
+    `dbg.subfield` to establish a verified use-def edge to the enum
+    declaration. The type carries no payload; all data lives on the op.
+  }];
+}
+
 #endif // CIRCT_DIALECT_DEBUG_DEBUGTYPES_TD

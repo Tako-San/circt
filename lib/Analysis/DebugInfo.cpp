@@ -139,6 +139,9 @@ void DebugInfoBuilder::visitModule(hw::HWModuleOp moduleOp, DIModule &module) {
       var->name = varOp.getNameAttr();
       var->loc = varOp.getLoc();
       var->value = varOp.getValue();
+      if (auto enumDefVal = varOp.getEnumDef())
+        if (auto enumDefOp = enumDefVal.getDefiningOp<debug::EnumDefOp>())
+          var->enumDef = enumDefOp.getOperation();
       getScope(varOp.getScope()).variables.push_back(var);
       return;
     }
