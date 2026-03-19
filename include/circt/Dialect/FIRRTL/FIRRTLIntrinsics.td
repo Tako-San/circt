@@ -29,7 +29,7 @@ def GenericIntrinsicOp : FIRRTLOp<"int.generic",
 
   let arguments = (
     ins StrAttr:$intrinsic,
-    Variadic<FIRRTLBaseType>:$operands,
+    Variadic<PassiveType>:$operands,
     DefaultValuedAttr<ParamDeclArrayAttr, "{}">:$parameters
   );
 
