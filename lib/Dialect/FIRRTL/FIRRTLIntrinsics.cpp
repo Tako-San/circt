@@ -7,9 +7,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/FIRRTL/FIRRTLIntrinsics.h"
+#include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
-#include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/JSON.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -731,6 +731,409 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// Debug intrinsic converters
+//===----------------------------------------------------------------------===//
+
+class CirctDebugModuleInfoConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(0) || gi.namedParam("className") ||
+           gi.namedParam("name") || gi.namedParam("sourceFile") ||
+           gi.namedIntParam("sourceLine") ||
+           gi.namedParam("ctorParams", /*optional=*/true) ||
+           gi.hasNParam(4, 1) || gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto typeName = gi.getParamValue<StringAttr>("className");
+    auto instName = gi.getParamValue<StringAttr>("name");
+    auto sourceFile = gi.getParamValue<StringAttr>("sourceFile");
+    auto sourceLine = gi.getParamValue<IntegerAttr>("sourceLine");
+    auto ctorParams = gi.getParamValue<StringAttr>("ctorParams"); // nullable
+
+    auto lineAttr =
+        IntegerAttr::get(rewriter.getIntegerType(64, /*isSigned=*/true),
+                         sourceLine.getValue().getSExtValue());
+
+    rewriter.replaceOpWithNewOp<debug::ModuleInfoOp>(
+        gi.op, typeName, instName, sourceFile, lineAttr, ctorParams);
+  }
+};
+
+class CirctDebugEnumDefConverter : public IntrinsicConverter {
+  std::shared_ptr<llvm::StringMap<Value>> enumDefMap;
+
+public:
+  CirctDebugEnumDefConverter(std::shared_ptr<llvm::StringMap<Value>> enumDefMap)
+      : enumDefMap(enumDefMap) {}
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(0) || gi.namedParam("name") || gi.namedParam("fqn") ||
+           gi.namedParam("variants") || gi.hasNParam(3) || gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto name = gi.getParamValue<StringAttr>("name");
+    auto fqn = gi.getParamValue<StringAttr>("fqn");
+    auto variantsStr = gi.getParamValue<StringAttr>("variants");
+
+    auto *ctx = rewriter.getContext();
+    SmallVector<Attribute> variants;
+
+    auto parsed = llvm::json::parse(variantsStr.strref());
+    if (auto err = parsed.takeError()) {
+      gi.op.emitError("circt_debug_enumdef: failed to parse 'variants' JSON: ")
+          << llvm::toString(std::move(err));
+      rewriter.eraseOp(gi.op);
+      return;
+    }
+
+    auto *arr = parsed->getAsArray();
+    if (!arr) {
+      gi.op.emitError("circt_debug_enumdef: 'variants' must be a JSON array");
+      rewriter.eraseOp(gi.op);
+      return;
+    }
+
+    for (const auto &item : *arr) {
+      auto *obj = item.getAsObject();
+      if (!obj)
+        continue;
+      auto varName = obj->getString("name").value_or("unknown");
+      int64_t val = obj->getInteger("value").value_or(0);
+      NamedAttribute entries[] = {
+          {StringAttr::get(ctx, "name"), StringAttr::get(ctx, varName)},
+          {StringAttr::get(ctx, "value"), rewriter.getI64IntegerAttr(val)}};
+      variants.push_back(DictionaryAttr::get(ctx, entries));
+    }
+
+    debug::EnumDefOp enumDefOp = debug::EnumDefOp::create(
+        rewriter, gi.op.getLoc(), name, fqn, ArrayAttr::get(ctx, variants));
+    rewriter.eraseOp(gi.op);
+    (*enumDefMap)[fqn.getValue()] = enumDefOp.getResult();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Debug type-tag converter helpers
+//===----------------------------------------------------------------------===//
+
+/// Metadata extracted from a leaf circt_debug_typetag intrinsic
+/// (one with non-empty "parent" parameter). Stored keyed by the
+/// full dot-separated signal name (e.g. "io.state").
+struct LeafMeta {
+  /// SSA value of the dbg.enumdef op for this field, if it carries
+  /// a ChiselEnum type. Null if the field is a plain ground type.
+  Value enumDefVal;
+};
+
+/// Maps full signal path → LeafMeta.
+/// Shared between CirctDebugEnumDefConverter (writer) and
+/// CirctDebugTypeTagConverter (reader for leaf phase, writer for
+/// aggregate phase).
+using LeafMetaMap = llvm::StringMap<LeafMeta>;
+
+/// Parse a JSON string of the form
+///   [{"name": "n", "typeName": "Int"}, ...]
+/// into an ArrayAttr of DictionaryAttrs.
+/// Returns null ArrayAttr if the string is null or empty.
+static ArrayAttr parseParamsJSON(MLIRContext *ctx, StringAttr paramsStr) {
+  if (!paramsStr || paramsStr.getValue().empty())
+    return {};
+
+  auto parsed = llvm::json::parse(paramsStr.strref());
+  if (auto err = parsed.takeError()) {
+    // Discard parse errors silently — params are best-effort debug info.
+    llvm::consumeError(std::move(err));
+    return {};
+  }
+
+  auto *arr = parsed->getAsArray();
+  if (!arr)
+    return {};
+
+  SmallVector<Attribute> entries;
+  for (const auto &item : *arr) {
+    auto *obj = item.getAsObject();
+    if (!obj)
+      continue;
+    SmallVector<NamedAttribute> fields;
+    for (auto &[k, v] : *obj)
+      if (auto s = v.getAsString())
+        fields.push_back({StringAttr::get(ctx, StringRef(k)),
+                          StringAttr::get(ctx, *s)});
+    entries.push_back(DictionaryAttr::get(ctx, fields));
+  }
+  return ArrayAttr::get(ctx, entries);
+}
+
+/// Recursively unpack a FIRRTL aggregate value into a `dbg.struct` or
+/// `dbg.array`, mirroring what MaterializeDebugInfo does for ports/wires.
+/// Ground types are returned as-is. Non-FIRRTL types return a null Value.
+/// All `firrtl.subfield` / `firrtl.subindex` ops created here are
+/// passive-typed (flip is stored in BundleElement.isFlip, not in the result
+/// type), so they satisfy the PassiveType constraint of any downstream op.
+static Value buildDebugAggregate(OpBuilder &builder, Location loc,
+                                 Value value) {
+  return FIRRTLTypeSwitch<Type, Value>(value.getType())
+      .Case<BundleType>([&](BundleType type) -> Value {
+        SmallVector<Value> fields;
+        SmallVector<Attribute> names;
+        SmallVector<Operation *> subOps;
+        for (auto [index, element] : llvm::enumerate(type.getElements())) {
+          auto subOp = SubfieldOp::create(builder, loc, value, index);
+          subOps.push_back(subOp.getOperation());
+          if (auto dbgVal = buildDebugAggregate(builder, loc, subOp.getResult())) {
+            fields.push_back(dbgVal);
+            names.push_back(element.name);
+          }
+        }
+        Value result = debug::StructOp::create(builder, loc, fields,
+                                               builder.getArrayAttr(names));
+        for (auto *sub : subOps)
+          if (sub->use_empty())
+            sub->erase();
+        return result;
+      })
+      .Case<FVectorType>([&](FVectorType type) -> Value {
+        SmallVector<Value> elements;
+        SmallVector<Operation *> subOps;
+        for (unsigned i = 0; i < type.getNumElements(); ++i) {
+          auto subOp = SubindexOp::create(builder, loc, value, i);
+          subOps.push_back(subOp.getOperation());
+          if (auto dbgVal = buildDebugAggregate(builder, loc, subOp.getResult()))
+            elements.push_back(dbgVal);
+        }
+        Value result;
+        if (!elements.empty() && elements.size() == type.getNumElements())
+          result = debug::ArrayOp::create(builder, loc, elements);
+        for (auto *sub : subOps)
+          if (sub->use_empty())
+            sub->erase();
+        return result;
+      })
+      .Case<FIRRTLBaseType>(
+          [&](FIRRTLBaseType type) -> Value { return type.isGround() ? value : Value{}; })
+      .Default([](auto) -> Value { return {}; });
+}
+
+/// Recursively unpack a FIRRTL aggregate value into a `dbg.struct` or
+/// `dbg.array`, wrapping leaf values with enum annotations using
+/// `dbg.subfield`. Uses `leafMetaMap` to look up enumDef values for
+/// annotated fields.
+static Value buildDebugAggregateWithMeta(OpBuilder &builder, Location loc,
+                                         Value value, StringRef parentPath,
+                                         const LeafMetaMap &leafMetaMap) {
+  return FIRRTLTypeSwitch<Type, Value>(value.getType())
+      .Case<BundleType>([&](BundleType type) -> Value {
+        SmallVector<Value> fields;
+        SmallVector<Attribute> names;
+        SmallVector<Operation *> subOps;
+        for (auto [index, element] : llvm::enumerate(type.getElements())) {
+          auto subOp = SubfieldOp::create(builder, loc, value, index);
+          subOps.push_back(subOp.getOperation());
+          // Build field path: parentPath.elementName
+          // Always build the full path (e.g., "io.inner.x")
+          std::string fieldPath =
+              (Twine(parentPath) + "." + element.name.getValue()).str();
+          if (auto dbgVal = buildDebugAggregateWithMeta(
+                  builder, loc, subOp.getResult(),
+                  StringRef(fieldPath), leafMetaMap)) {
+            fields.push_back(dbgVal);
+            names.push_back(element.name);
+          }
+        }
+        Value result = debug::StructOp::create(builder, loc, fields,
+                                               builder.getArrayAttr(names));
+        for (auto *sub : subOps)
+          if (sub->use_empty())
+            sub->erase();
+        return result;
+      })
+      .Case<FVectorType>([&](FVectorType type) -> Value {
+        SmallVector<Value> elements;
+        SmallVector<Operation *> subOps;
+        for (unsigned i = 0; i < type.getNumElements(); ++i) {
+          auto subOp = SubindexOp::create(builder, loc, value, i);
+          subOps.push_back(subOp.getOperation());
+          // Build element path: parentPath[index]
+          // Always build the full path (e.g., "io[0]")
+          std::string elemPath =
+              (Twine(parentPath) + "[" + Twine(i) + "]").str();
+          if (auto dbgVal = buildDebugAggregateWithMeta(
+                  builder, loc, subOp.getResult(),
+                  StringRef(elemPath), leafMetaMap))
+            elements.push_back(dbgVal);
+        }
+        Value result;
+        if (!elements.empty() && elements.size() == type.getNumElements())
+          result = debug::ArrayOp::create(builder, loc, elements);
+        for (auto *sub : subOps)
+          if (sub->use_empty())
+            sub->erase();
+        return result;
+      })
+      .Case<FIRRTLBaseType>([&](FIRRTLBaseType type) -> Value {
+        if (!type.isGround())
+          return {};
+        // Look up enum annotation for this leaf
+        auto it = leafMetaMap.find(parentPath);
+        if (it != leafMetaMap.end() && it->second.enumDefVal) {
+          // Wrap the value with debug::SubFieldOp for enum annotation
+          return debug::SubFieldOp::create(builder, loc, value,
+                                           it->second.enumDefVal).getResult();
+        }
+        return value;
+      })
+      .Default([](auto) -> Value { return {}; });
+}
+
+/// circt_debug_typetag lowering.
+///
+/// Implements a two-phase conversion for handling enum annotations on
+/// Bundle/Vec fields:
+///
+/// Phase 1 (leaf phase):
+///   - For intrinsics with non-empty "parent" parameter, store metadata
+///     (enumDef if the field is an enum type) in leafMetaMap.
+///   - The operation is erased without creating dbg.variable.
+///   - Full signal path key is stored as e.g. "io.state" or "io.state.value".
+///
+/// Phase 2 (root phase):
+///   - For intrinsics with empty/missing "parent" parameter, build
+///     dbg.struct / dbg.array with enum annotations using
+///     buildDebugAggregateWithMeta, passing the leafMetaMap.
+///   - Create dbg.variable with the annotated aggregate.
+///   - If the root itself is an enum type, also use enumDef.
+///
+/// This two-phase approach is needed because enumDef SSA values from
+/// circt_debug_enumdef may not be available when processing leaf typetags
+/// if they appear later in the IR.
+class CirctDebugTypeTagConverter : public IntrinsicConverter {
+  std::shared_ptr<llvm::StringMap<Value>> enumDefMap;
+  std::shared_ptr<LeafMetaMap> leafMetaMap;
+
+public:
+  CirctDebugTypeTagConverter(
+      std::shared_ptr<llvm::StringMap<Value>> enumDefMap,
+      std::shared_ptr<LeafMetaMap> leafMetaMap)
+      : enumDefMap(enumDefMap), leafMetaMap(leafMetaMap) {}
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(1) || gi.namedParam("name") ||
+           gi.namedParam("parent", /*optional=*/true) ||
+           gi.namedParam("className") || gi.namedIntParam("width") ||
+           gi.namedParam("binding") || gi.namedParam("direction") ||
+           gi.namedParam("sourceFile") || gi.namedIntParam("sourceLine") ||
+           gi.namedParam("params", /*optional=*/true) ||
+           gi.namedParam("enumType", /*optional=*/true) ||
+           gi.namedParam("enumTypeFqn", /*optional=*/true) ||
+           gi.namedParam("kind", /*optional=*/true) ||
+           gi.hasNParam(6, 5) || gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
+               PatternRewriter &rewriter) override {
+    auto varName  = gi.getParamValue<StringAttr>("name");
+    auto typeName = gi.getParamValue<StringAttr>("className");
+    auto params   = gi.getParamValue<StringAttr>("params");
+    auto parent   = gi.getParamValue<StringAttr>("parent");
+    auto enumFqn  = gi.getParamValue<StringAttr>("enumTypeFqn");
+
+    // Phase 1: Leaf phase - store metadata in leafMetaMap
+    if (parent && !parent.getValue().empty()) {
+      LeafMeta meta;
+      // Look up enumDef from enumDefMap if this field is an enum type
+      if (enumFqn) {
+        auto it = enumDefMap->find(enumFqn.getValue());
+        if (it != enumDefMap->end())
+          meta.enumDefVal = it->second;
+      }
+      // Store with the complete path as the key (e.g., "io.inner.x")
+      (*leafMetaMap)[varName.getValue()] = meta;
+      rewriter.eraseOp(gi.op);
+      return;
+    }
+
+    // Phase 2: Root phase - create dbg.variable with annotated aggregate
+    Value rawValue = adaptor.getOperands()[0];
+    auto loc = gi.op.getLoc();
+
+    // Resolve enumDef for the root variable if it's itself an enum
+    Value rootEnumDef;
+    if (enumFqn) {
+      auto it = enumDefMap->find(enumFqn.getValue());
+      if (it != enumDefMap->end())
+        rootEnumDef = it->second;
+    }
+
+    // Build dbg.struct / dbg.array with enum annotations from leafMetaMap
+    // For ground types, use the value directly
+    Value dbgValue = buildDebugAggregateWithMeta(rewriter, loc, rawValue,
+                                                varName.getValue(),
+                                                *leafMetaMap);
+    if (!dbgValue)
+      dbgValue = rawValue; // fallback for unexpected types
+
+    rewriter.replaceOpWithNewOp<debug::VariableOp>(
+        gi.op, varName, dbgValue, typeName,
+        /*params=*/parseParamsJSON(rewriter.getContext(), params),
+        /*enumDef=*/rootEnumDef,
+        /*scope=*/Value{});
+  }
+};
+
+class CirctDebugMemInfoConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+
+  bool check(GenericIntrinsic gi) override {
+    return gi.hasNInputs(0) || gi.namedParam("memName") ||
+           gi.namedParam("memoryKind") || gi.namedIntParam("depth") ||
+           gi.namedParam("sourceFile") || gi.namedIntParam("sourceLine") ||
+           gi.namedParam("dataType") || gi.namedParam("readUnderWrite", true) ||
+           gi.hasNParam(6, 1) || gi.hasNoOutput();
+  }
+
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor,
+               PatternRewriter &rewriter) override {
+    auto memName = gi.getParamValue<StringAttr>("memName");
+    auto memoryKind = gi.getParamValue<StringAttr>("memoryKind");
+    auto depth = gi.getParamValue<IntegerAttr>("depth");
+    auto sourceFile = gi.getParamValue<StringAttr>("sourceFile");
+    auto sourceLine = gi.getParamValue<IntegerAttr>("sourceLine");
+    auto dataType = gi.getParamValue<StringAttr>("dataType");
+    auto readUnderWrite = gi.getParamValue<StringAttr>("readUnderWrite");
+
+    auto depthAttr =
+        IntegerAttr::get(rewriter.getIntegerType(64, /*isSigned=*/true),
+                         depth.getValue().getSExtValue());
+    auto lineAttr =
+        IntegerAttr::get(rewriter.getIntegerType(64, /*isSigned=*/true),
+                         sourceLine.getValue().getSExtValue());
+
+    debug::MemInfoOp::create(rewriter, gi.op.getLoc(), memName, memoryKind,
+                             depthAttr, sourceFile, lineAttr, dataType,
+                             readUnderWrite);
+    rewriter.eraseOp(gi.op);
+  }
+};
+
+class CirctDebugTypeDefConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+  bool check(GenericIntrinsic gi) override { return false; }
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor,
+               PatternRewriter &rewriter) override {
+    rewriter.eraseOp(gi.op);  // структурный маркер, потребляется экспортным пассом
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // View intrinsic converter and helpers
 //===----------------------------------------------------------------------===//
 
@@ -981,4 +1384,18 @@ public:
 void FIRRTLIntrinsicLoweringDialectInterface::populateIntrinsicLowerings(
     IntrinsicLowerings &lowering) const {
   populateLowerings(lowering);
+
+  // Create shared enumDefMap and leafMetaMap for converters to pass
+  // enumDef SSA values and leaf metadata
+  auto enumDefMap = std::make_shared<llvm::StringMap<Value>>();
+  auto leafMetaMap = std::make_shared<LeafMetaMap>();
+
+  // Add debug intrinsic converters (not in tablegen yet)
+  lowering.add<CirctDebugModuleInfoConverter>("circt_debug_moduleinfo");
+  lowering.addConverter<CirctDebugEnumDefConverter>("circt_debug_enumdef",
+                                                     enumDefMap);
+  lowering.addConverter<CirctDebugTypeTagConverter>("circt_debug_typetag",
+                                                     enumDefMap, leafMetaMap);
+  lowering.add<CirctDebugTypeDefConverter>("circt_debug_typedef");
+  lowering.add<CirctDebugMemInfoConverter>("circt_debug_meminfo");
 }

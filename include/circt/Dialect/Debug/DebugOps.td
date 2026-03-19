@@ -50,7 +50,7 @@ def ScopeOp : DebugOp<"scope"> {
 }
 
 
-def VariableOp : DebugOp<"variable"> {
+def VariableOp : DebugOp<"variable", [AttrSizedOperandSegments]> {
   let summary = "A named value to be captured in debug info";
   let description = [{
     Marks a value to be tracked in DI under the given name. The `dbg.variable`
@@ -71,10 +71,81 @@ def VariableOp : DebugOp<"variable"> {
   let arguments = (ins
     StrAttr:$name,
     AnyType:$value,
+    OptionalAttr<StrAttr>:$typeName,
+    OptionalAttr<ArrayAttr>:$params,
+    Optional<EnumDefType>:$enumDef,
     Optional<ScopeType>:$scope
   );
   let assemblyFormat = [{
-    $name `,` $value (`scope` $scope^)? attr-dict `:` type($value)
+    $name `,` $value
+    (`enumDef` $enumDef^)?
+    attr-dict
+    (`scope` $scope^)?
+    `:` type($value)
+  }];
+}
+
+
+def SubFieldOp : DebugOp<"subfield", [Pure]> {
+  let summary = "Annotates a single Bundle field with an enum definition";
+  let description = [{
+    Wraps a ground-type FIRRTL value for Bundle fields carrying ChiselEnum
+    type. The field name is already encoded in the `ArrayAttr` key of the
+    `dbg.struct` operation that consumes this `!dbg.subfield` result. The
+    operation's purpose is to attach a verified SSA edge to `dbg.enumdef`
+    for downstream consumers that need to track which enum definition applies
+    to which field.
+  }];
+  let arguments = (ins
+    AnyType:$value,
+    Optional<EnumDefType>:$enumDef
+  );
+  let results = (outs SubFieldType:$result);
+  let assemblyFormat = [{
+    $value (`enumDef` $enumDef^)? attr-dict `:` type($value)
+  }];
+}
+
+
+def EnumDefOp : DebugOp<"enumdef", [Pure]> {
+  let summary = "Define the named variants of a source-language enumeration";
+  let description = [{
+    Declares an enumeration by name and ordered list of variants. Each variant
+    is a DictionaryAttr with keys `name` (StringAttr) and `value`
+    (IntegerAttr i64). Emitted once per distinct enum type per module by the
+    intrinsic lowering pass. Referenced by name via the `enumRef` attribute
+    on `dbg.variable`.
+  }];
+  let arguments = (ins
+    StrAttr:$name,
+    StrAttr:$fqn,
+    ArrayAttr:$variants
+  );
+  let results = (outs EnumDefType:$result);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+  let hasCanonicalizer = true;
+}
+
+
+def ModuleInfoOp : DebugOp<"moduleinfo"> {
+  let summary = "Source-language class name and location for the enclosing module";
+  let description = [{
+    Emitted once per hardware module by the intrinsic lowering pass. Carries
+    the Chisel class name, instance name, source location and optional
+    constructor parameters. Consumed by the hw-debug-info export pass.
+  }];
+  let arguments = (ins
+    StrAttr:$typeName,
+    StrAttr:$instanceName,
+    StrAttr:$sourceFile,
+    SI64Attr:$sourceLine,
+    OptionalAttr<StrAttr>:$ctorParams
+  );
+  let assemblyFormat = [{
+    $typeName `,` $instanceName `,` $sourceFile `:` $sourceLine
+    (`params` $ctorParams^)?
+    attr-dict
   }];
 }
 
@@ -114,6 +185,31 @@ def ArrayOp : DebugOp<"array", [Pure, SameTypeOperands]> {
   let arguments = (ins Variadic<AnyType>:$elements);
   let results = (outs ArrayType:$result);
   let hasCustomAssemblyFormat = 1;
+}
+
+def MemInfoOp : DebugOp<"meminfo"> {
+  let summary = "Source-language memory metadata for the enclosing module";
+  let description = [{
+    Emitted once per memory declaration by the intrinsic lowering pass.
+    Carries the memory name, kind (Mem vs SyncReadMem), depth, source
+    location, data type descriptor, and optional read-under-write policy.
+    Consumed by debug info export passes.
+  }];
+  let arguments = (ins
+    StrAttr:$memName,
+    StrAttr:$memoryKind,
+    SI64Attr:$depth,
+    StrAttr:$sourceFile,
+    SI64Attr:$sourceLine,
+    StrAttr:$dataType,
+    OptionalAttr<StrAttr>:$readUnderWrite
+  );
+  let assemblyFormat = [{
+    $memName `,` $memoryKind `,` $depth `,` $sourceFile `:` $sourceLine
+    `,` `type` $dataType
+    (`ruw` $readUnderWrite^)?
+    attr-dict
+  }];
 }
 
 #endif // CIRCT_DIALECT_DEBUG_DEBUGOPS_TD

@@ -4872,10 +4872,15 @@ ParseResult FIRStmtParser::parseCombMem() {
   if (!vectorType)
     return emitError("cmem requires vector type");
 
+  auto elementType = vectorType.getElementType();
+  if (!elementType.isPassive())
+    return emitError(startTok.getLoc(),
+                     "behavioral memory element type must be passive");
+
   auto annotations = getConstants().emptyArrayAttr;
   StringAttr sym = {};
   auto result = CombMemOp::create(
-      builder, vectorType.getElementType(), vectorType.getNumElements(), id,
+      builder, elementType, vectorType.getNumElements(), id,
       NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
@@ -4915,10 +4920,15 @@ ParseResult FIRStmtParser::parseSeqMem() {
   if (!vectorType)
     return emitError("smem requires vector type");
 
+  auto elementType = vectorType.getElementType();
+  if (!elementType.isPassive())
+    return emitError(startTok.getLoc(),
+                     "behavioral memory element type must be passive");
+
   auto annotations = getConstants().emptyArrayAttr;
   StringAttr sym = {};
   auto result = SeqMemOp::create(
-      builder, vectorType.getElementType(), vectorType.getNumElements(), ruw,
+      builder, elementType, vectorType.getNumElements(), ruw,
       id, NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }

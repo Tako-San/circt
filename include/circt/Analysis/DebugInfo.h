@@ -54,6 +54,9 @@ struct DIVariable {
   LocationAttr loc;
   /// The SSA value representing the value of this variable.
   Value value = nullptr;
+  /// The enum definition this variable refers to, if any (stored as
+  /// Operation*).
+  Operation *enumDef = nullptr;
 };
 
 /// Debug information attached to an operation and the operations nested within.

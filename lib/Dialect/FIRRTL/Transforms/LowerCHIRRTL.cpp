@@ -58,6 +58,9 @@ struct LowerCHIRRTLPass
   // Chain the CHIRRTL visitor to the FIRRTL visitor.
   void visitInvalidCHIRRTL(Operation *op) { dispatchVisitor(op); }
   void visitUnhandledCHIRRTL(Operation *op) { visitUnhandledOp(op); }
+  // Non-FIRRTL ops (e.g. dbg.variable) must also have their operands updated
+  // when they reference values produced by CHIRRTL memory ports.
+  void visitInvalidOp(Operation *op) { visitUnhandledOp(op); }
 
   /// Get a the constant 0.  This constant is inserted at the beginning of the
   /// module.
