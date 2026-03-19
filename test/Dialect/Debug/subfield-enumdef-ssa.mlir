@@ -4,10 +4,12 @@ module {
   func.func @Test() {
     %e = dbg.enumdef "FieldEnum" fqn "pkg.FieldEnum" {VALUE = 42 : i64}
     %0 = arith.constant 0 : i32
-    %f = dbg.subfield value, %0 enumDef %e : i32
+
+    // CHECK: %[[SF:.+]] = dbg.subfield %{{.*}} enumDef %{{.*}} : i32
+    %f = dbg.subfield %0 enumDef %e : i32
+
+    // Используем в struct чтобы SubFieldOp не был dead-code
+    %s = dbg.struct {"field": %f} : !dbg.subfield
     return
   }
 }
-// CHECK: %{{.+}} = dbg.enumdef
-// CHECK: %c0_i32 = arith.constant 0 : i32
-// CHECK: %{{[0-9]+}} = dbg.subfield "value", %c0_i32 enumDef %{{[0-9]+}} : i32

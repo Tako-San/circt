@@ -78,7 +78,6 @@ void StructOp::print(OpAsmPrinter &printer) {
     printer << getFields().getTypes();
   }
 }
-
 //===----------------------------------------------------------------------===//
 // ArrayOp
 //===----------------------------------------------------------------------===//
@@ -115,82 +114,9 @@ void ArrayOp::print(OpAsmPrinter &printer) {
     printer << getElements()[0].getType();
   }
 }
-
-//===----------------------------------------------------------------------===//
-// SubFieldOp
-//===----------------------------------------------------------------------===//
-
-ParseResult SubFieldOp::parse(OpAsmParser &parser, OperationState &result) {
-  StringRef name;
-  OpAsmParser::UnresolvedOperand valueOperand;
-
-  // Parse name and value (keeping existing logic):
-  if (parser.parseKeyword(&name) || parser.parseComma() ||
-      parser.parseOperand(valueOperand))
-    return failure();
-
-  mlir::NamedAttrList attrs;
-  if (parser.parseOptionalAttrDict(attrs))
-    return failure();
-
-  // ADD enumDef parsing here:
-  OpAsmParser::UnresolvedOperand enumDefOperand;
-  bool hasEnumDef = false;
-  if (succeeded(parser.parseOptionalKeyword("enumDef"))) {
-    if (parser.parseOperand(enumDefOperand))
-      return failure();
-    hasEnumDef = true;
-  }
-
-  // Parse type:
-  Type valueType;
-  if (parser.parseColon() || parser.parseType(valueType))
-    return failure();
-
-  // Resolve operands:
-  if (parser.resolveOperand(valueOperand, valueType, result.operands))
-    return failure();
-
-  if (hasEnumDef) {
-    auto enumDefType = EnumDefType::get(parser.getContext());
-    if (parser.resolveOperand(enumDefOperand, enumDefType, result.operands))
-      return failure();
-  }
-
-  // Set operand_segment_sizes:
-  result.addAttribute(
-      "operand_segment_sizes",
-      parser.getBuilder().getDenseI32ArrayAttr({1, hasEnumDef ? 1 : 0}));
-
-  // Set name attribute:
-  result.addAttribute("name", parser.getBuilder().getStringAttr(name));
-  result.addAttributes(attrs);
-  result.addTypes(SubFieldType::get(parser.getContext()));
-  return success();
-}
-
-void SubFieldOp::print(OpAsmPrinter &p) {
-  p << ' ';
-  p.printAttribute(getNameAttr());
-  p << ", ";
-  p.printOperand(getValue());
-
-  // Print optional enumDef operand
-  SmallVector<StringRef> elidedAttrs = {"name", "operand_segment_sizes"};
-  if (getEnumDef()) {
-    p << " enumDef ";
-    p.printOperand(getEnumDef());
-  }
-
-  p.printOptionalAttrDict(getOperation()->getAttrs(), elidedAttrs);
-  p << " : ";
-  p.printType(getValue().getType());
-}
-
 //===----------------------------------------------------------------------===//
 // EnumDefOp
 //===----------------------------------------------------------------------===//
-
 LogicalResult EnumDefOp::verify() {
   for (auto attr : getVariants()) {
     auto dict = dyn_cast<DictionaryAttr>(attr);

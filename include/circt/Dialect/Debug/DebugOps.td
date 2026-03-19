@@ -87,22 +87,23 @@ def VariableOp : DebugOp<"variable", [AttrSizedOperandSegments]> {
 
 
 def SubFieldOp : DebugOp<"subfield", [Pure]> {
-  let summary = "A named subfield of an aggregate to be captured in debug info";
+  let summary = "Annotates a single Bundle field with an enum definition";
   let description = [{
-    Like `dbg.variable` but represents a single named field within a Bundle
-    or Vec aggregate. Returns a `!dbg.subfield` value consumed by `dbg.struct`
-    or `dbg.array`. Has no `scope` operand — scope is inherited from the
-    enclosing `dbg.variable`.
+    Wraps a ground-type FIRRTL value for Bundle fields carrying ChiselEnum
+    type. The field name is already encoded in the `ArrayAttr` key of the
+    `dbg.struct` operation that consumes this `!dbg.subfield` result. The
+    operation's purpose is to attach a verified SSA edge to `dbg.enumdef`
+    for downstream consumers that need to track which enum definition applies
+    to which field.
   }];
   let arguments = (ins
-    StrAttr:$name,
     AnyType:$value,
-    OptionalAttr<StrAttr>:$typeName,
-    OptionalAttr<ArrayAttr>:$params,
     Optional<EnumDefType>:$enumDef
   );
   let results = (outs SubFieldType:$result);
-  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = [{
+    $value (`enumDef` $enumDef^)? attr-dict `:` type($value)
+  }];
 }
 
 
