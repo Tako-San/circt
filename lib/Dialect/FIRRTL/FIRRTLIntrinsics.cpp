@@ -1005,6 +1005,16 @@ public:
   }
 };
 
+class CirctDebugTypeDefConverter : public IntrinsicConverter {
+public:
+  using IntrinsicConverter::IntrinsicConverter;
+  bool check(GenericIntrinsic gi) override { return false; }
+  void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor,
+               PatternRewriter &rewriter) override {
+    rewriter.eraseOp(gi.op);  // структурный маркер, потребляется экспортным пассом
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // View intrinsic converter and helpers
 //===----------------------------------------------------------------------===//
@@ -1263,8 +1273,9 @@ void FIRRTLIntrinsicLoweringDialectInterface::populateIntrinsicLowerings(
   // Add debug intrinsic converters (not in tablegen yet)
   lowering.add<CirctDebugModuleInfoConverter>("circt_debug_moduleinfo");
   lowering.addConverter<CirctDebugEnumDefConverter>("circt_debug_enumdef",
-                                                    enumDefMap);
+                                                     enumDefMap);
   lowering.addConverter<CirctDebugTypeTagConverter>("circt_debug_typetag",
-                                                    enumDefMap);
+                                                     enumDefMap);
+  lowering.add<CirctDebugTypeDefConverter>("circt_debug_typedef");
   lowering.add<CirctDebugMemInfoConverter>("circt_debug_meminfo");
 }
