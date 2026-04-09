@@ -263,6 +263,15 @@ public:
     (addConverter<T>(args), ...);
   }
 
+  /// Registers a converter with constructor arguments.
+  template <typename T, typename... Args>
+  void addConverter(StringRef name, Args... args) {
+    auto nameAttr = StringAttr::get(context, name);
+    assert(!conversions.contains(nameAttr) &&
+           "duplicate conversion for intrinsic");
+    conversions.try_emplace(nameAttr, std::make_unique<T>(args...));
+  }
+
   /// Lowers all intrinsics in a module.  Returns number converted or failure.
   FailureOr<size_t> lower(FModuleOp mod, bool allowUnknownIntrinsics = false);
 
@@ -300,6 +309,25 @@ struct FIRRTLIntrinsicLoweringDialectInterface
   using IntrinsicLoweringDialectInterface::IntrinsicLoweringDialectInterface;
   void populateIntrinsicLowerings(IntrinsicLowerings &lowerings) const override;
 };
+
+/// Pre-pass: in a single module walk, lift `circt_debug_enumdef` intrinsics
+/// into module-level `dbg.enumdef` ops (deduplicated by fqn; on fqn collision
+/// with mismatched variants the first wins with a warning) and collect
+/// `circt_debug_subfield` intrinsics into the module's `firrtl.debug_leaves`
+/// ArrayAttr. Both kinds of intrinsic are erased. Must run before
+/// `IntrinsicLowerings::lower` so var converters can find the enumdefs and
+/// leaf metadata. Returns failure on malformed intrinsics.
+///
+/// Frontend contract for `circt_debug_subfield`:
+///   - `parent` (mandatory) is the enclosing var's `name` and is the sole
+///     var<->leaf linkage key. Do not derive it from `name`.
+///   - `name` is the full dotted/indexed display path (e.g. `"io.state"`,
+///     `"v[0].x"`); used for display and path-matching, NOT for linkage.
+LogicalResult liftDebugIntrinsics(FModuleOp mod, OpBuilder &builder);
+
+/// Post-pass: remove the `firrtl.debug_leaves` attribute after lowering;
+/// otherwise downstream passes see spurious type metadata on the module op.
+void clearDebugLeavesAttr(FModuleOp mod);
 
 } // namespace firrtl
 } // namespace circt

@@ -11,9 +11,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLIntrinsics.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/ScopeExit.h"
 
 namespace circt {
 namespace firrtl {
@@ -39,20 +41,32 @@ struct LowerIntrinsicsPass
 };
 } // namespace
 
-/// Initialize the conversions for use during execution.
+/// Build the immutable converter set once, shared across module invocations.
 LogicalResult LowerIntrinsicsPass::initialize(MLIRContext *context) {
-  IntrinsicLowerings lowering(context);
-
-  IntrinsicLoweringInterfaceCollection loweringCollection(context);
-  loweringCollection.populateIntrinsicLowerings(lowering);
-
-  this->lowering = std::make_shared<IntrinsicLowerings>(std::move(lowering));
+  IntrinsicLowerings local(context);
+  IntrinsicLoweringInterfaceCollection collection(context);
+  collection.populateIntrinsicLowerings(local);
+  this->lowering = std::make_shared<IntrinsicLowerings>(std::move(local));
   return success();
 }
 
 // This is the main entrypoint for the lowering pass.
 void LowerIntrinsicsPass::runOnOperation() {
-  auto result = lowering->lower(getOperation());
+  auto mod = getOperation();
+
+  // The transient `firrtl.debug_leaves` attr is wiped on every exit path so
+  // a phase-2 failure can't leak scaffolding into downstream passes.
+  llvm::scope_exit cleanup{[&] { firrtl::clearDebugLeavesAttr(mod); }};
+
+  // Phase 1: stage debug-intrinsic data (dbg.enumdef ops, firrtl.debug_leaves
+  // attr) into the IR so converters don't depend on phase ordering.
+  // (firrtl.module is a Graph region; block-start insertion is cosmetic.)
+  OpBuilder builder = OpBuilder::atBlockBegin(mod.getBodyBlock());
+  if (mlir::failed(firrtl::liftDebugIntrinsics(mod, builder)))
+    return signalPassFailure();
+
+  // Phase 2: run intrinsic lowerings.
+  auto result = lowering->lower(mod);
   if (failed(result))
     return signalPassFailure();
 

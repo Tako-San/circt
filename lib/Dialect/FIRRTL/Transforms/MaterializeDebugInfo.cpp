@@ -38,20 +38,39 @@ struct MaterializeDebugInfoPass
 
 void MaterializeDebugInfoPass::runOnOperation() {
   auto module = getOperation();
+
+  // Must run BEFORE firrtl-lower-intrinsics: we skip ports/wires whose
+  // `circt_debug_var` intrinsic will produce a rich `dbg.variable`. After
+  // LowerIntrinsics those intrinsics are gone, leaving the skip-list empty.
+  llvm::StringSet<> coveredByIntrinsic;
+  module.walk([&](firrtl::GenericIntrinsicOp op) {
+    if (op.getIntrinsic() != "circt_debug_var")
+      return;
+    for (auto param : op.getParameters()) {
+      auto p = cast<ParamDeclAttr>(param);
+      if (p.getName() != "name")
+        continue;
+      if (auto name = cast<StringAttr>(p.getValue()).getValue(); !name.empty())
+        coveredByIntrinsic.insert(name);
+      break;
+    }
+  });
+
   auto builder = OpBuilder::atBlockBegin(module.getBodyBlock());
 
-  // Create DI variables for each port.
   for (const auto &[port, value] :
        llvm::zip(module.getPorts(), module.getArguments())) {
-    materializeVariable(builder, port.name, value);
+    if (!coveredByIntrinsic.count(port.name.getValue()))
+      materializeVariable(builder, port.name, value);
   }
 
-  // Create DI variables for each declaration in the module body.
   module.walk([&](Operation *op) {
     TypeSwitch<Operation *>(op).Case<WireOp, NodeOp, RegOp, RegResetOp>(
         [&](auto op) {
-          builder.setInsertionPointAfter(op);
-          materializeVariable(builder, op.getNameAttr(), op.getResult());
+          if (!coveredByIntrinsic.count(op.getNameAttr().getValue())) {
+            builder.setInsertionPointAfter(op);
+            materializeVariable(builder, op.getNameAttr(), op.getResult());
+          }
         });
   });
 }

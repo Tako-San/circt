@@ -50,7 +50,7 @@ def ScopeOp : DebugOp<"scope"> {
 }
 
 
-def VariableOp : DebugOp<"variable"> {
+def VariableOp : DebugOp<"variable", [AttrSizedOperandSegments]> {
   let summary = "A named value to be captured in debug info";
   let description = [{
     Marks a value to be tracked in DI under the given name. The `dbg.variable`
@@ -65,19 +65,102 @@ def VariableOp : DebugOp<"variable"> {
     these source language values can be reconstituted from the actual IR values
     present at the end of compilation.
 
+    The operation may optionally carry source-language type information (the
+    type name and constructor parameters) which lets consumers reconstruct
+    the source language more precisely.
+
     See the rationale for examples and details. See the `dbg.scope` operation
     for additional details on how to use the `scope` operand.
   }];
   let arguments = (ins
     StrAttr:$name,
     AnyType:$value,
+    OptionalAttr<StrAttr>:$typeName,
+    OptionalAttr<ArrayAttr>:$params,
+    Optional<EnumDefType>:$enumDef,
     Optional<ScopeType>:$scope
   );
   let assemblyFormat = [{
-    $name `,` $value (`scope` $scope^)? attr-dict `:` type($value)
+    $name `,` $value (`enumDef` $enumDef^)? (`scope` $scope^)? attr-dict `:` type($value)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "::mlir::StringAttr":$name, "::mlir::Value":$value,
+                   "::mlir::Value":$scope), [{
+      build($_builder, $_state, name, value, /*typeName=*/nullptr,
+            /*params=*/nullptr, /*enumDef=*/nullptr, scope);
+    }]>
+  ];
+}
+
+
+def SubFieldOp : DebugOp<"subfield"> {
+  let summary = "A named value to be captured in debug info which is a subfield of an aggregate";
+  let description = [{
+    Tags a single leaf of an aggregate for debug info, carrying the same
+    optional source-language type / enum metadata as `dbg.variable`. Unlike
+    `dbg.variable`, a `dbg.subfield` only appears as an operand of a
+    `dbg.struct` or `dbg.array`; it never stands alone at module scope.
+  }];
+  let arguments = (ins
+    StrAttr:$name,
+    AnyType:$value,
+    OptionalAttr<StrAttr>:$typeName,
+    OptionalAttr<ArrayAttr>:$params,
+    Optional<EnumDefType>:$enumDef
+  );
+  let results = (outs SubFieldType:$result);
+  let assemblyFormat = [{
+    $name `,` $value (`enumDef` $enumDef^)? attr-dict `:` type($value)
   }];
 }
 
+def ModuleInfoOp : DebugOp<"moduleinfo"> {
+  let summary = "Define extra debug information for a module";
+  let description = [{
+    Creates debug information for a module. If present, this operation provides
+    extra information about the module type in the source language, such as its
+    type name and constructor parameters.
+  }];
+
+  let arguments = (ins
+    StrAttr:$typeName,
+    OptionalAttr<ArrayAttr>:$params
+  );
+
+  let assemblyFormat = [{ attr-dict }];
+}
+
+def EnumDefOp : DebugOp<"enumdef"> {
+  let summary = "Define the value variants of an enumeration";
+  let description = [{
+    Defines an enumeration type so consumers can reconstruct the named
+    variants from a raw integer value. Logically the mapping is
+    `int -> name`, but in IR it is stored as a `DictionaryAttr` keyed by
+    variant name with `IntegerAttr` values (the integer is not a valid
+    dictionary key); consumers reading variants programmatically must
+    invert the map. `DictionaryAttr` sorts keys lexicographically, so
+    declaration order is not preserved and consumers must not rely on it.
+
+    Declared once per enum per scope. The result is consumed by
+    `dbg.variable` and `dbg.subfield` ops whose value has this enum type.
+  }];
+
+  let arguments = (ins
+    StrAttr:$enumTypeName,
+    StrAttr:$fqn,
+    DictionaryAttr:$variantsMap,
+    Optional<ScopeType>:$scope
+  );
+
+  let results = (outs EnumDefType:$result);
+
+  let assemblyFormat = [{
+    $enumTypeName `,` `fqn` $fqn `,` $variantsMap (`scope` $scope^)? attr-dict
+  }];
+
+  let hasCanonicalizer = 1;
+}
 
 def StructOp : DebugOp<"struct", [
   Pure,

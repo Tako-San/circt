@@ -132,6 +132,33 @@ void DebugInfoBuilder::visitModule(hw::HWModuleOp moduleOp, DIModule &module) {
     }
   }
 
+  // Numeric enumdef IDs are emitter-facing scaffolding, not stored on the
+  // `dbg.enumdef` op itself. Assign sequential IDs in walk order; the op->id
+  // map on DIModule lets downstream consumers (EmitUHDI, etc.) resolve refs
+  // consistently. The variable walk below depends on `enumDefIds` being
+  // fully populated.
+  moduleOp->walk([&](Operation *op) {
+    if (auto miOp = dyn_cast<debug::ModuleInfoOp>(op)) {
+      module.sourceLangType.typeName = miOp.getTypeNameAttr();
+      module.sourceLangType.params = miOp.getParamsAttr();
+      return;
+    }
+    if (auto edOp = dyn_cast<debug::EnumDefOp>(op)) {
+      assert(module.enumDefIds.size() <
+                 std::numeric_limits<DIEnumDefId>::max() &&
+             "too many dbg.enumdef ops in module for DIEnumDefId");
+      auto id = static_cast<DIEnumDefId>(module.enumDefIds.size());
+      module.enumDefIds.try_emplace(edOp, id);
+      DIEnumValMap variants;
+      for (auto na : edOp.getVariantsMapAttr()) {
+        auto key = cast<IntegerAttr>(na.getValue()).getInt();
+        auto value = cast<StringAttr>(na.getName());
+        variants.insert({key, value});
+      }
+      module.enumDefinitions.insert({id, variants});
+    }
+  });
+
   // Fill in any missing DI as a fallback.
   moduleOp->walk([&](Operation *op) {
     if (auto varOp = dyn_cast<debug::VariableOp>(op)) {
@@ -139,6 +166,16 @@ void DebugInfoBuilder::visitModule(hw::HWModuleOp moduleOp, DIModule &module) {
       var->name = varOp.getNameAttr();
       var->loc = varOp.getLoc();
       var->value = varOp.getValue();
+      var->sourceLangType.typeName = varOp.getTypeNameAttr();
+      var->sourceLangType.params = varOp.getParamsAttr();
+      if (auto enumDefVal = varOp.getEnumDef()) {
+        var->enumDef = enumDefVal;
+        if (auto edOp = enumDefVal.getDefiningOp<debug::EnumDefOp>()) {
+          auto it = module.enumDefIds.find(edOp);
+          if (it != module.enumDefIds.end())
+            var->enumDefRef = it->second;
+        }
+      }
       getScope(varOp.getScope()).variables.push_back(var);
       return;
     }
