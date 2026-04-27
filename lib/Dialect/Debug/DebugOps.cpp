@@ -8,6 +8,7 @@
 
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/PatternMatch.h"
 
 using namespace circt;
 using namespace debug;
@@ -115,7 +116,9 @@ void ArrayOp::print(OpAsmPrinter &printer) {
   }
 }
 
-// Operation implementations generated from `Debug.td`
+//===----------------------------------------------------------------------===//
+// Generated operation code
+//===----------------------------------------------------------------------===//
 #define GET_OP_CLASSES
 #include "circt/Dialect/Debug/Debug.cpp.inc"
 
@@ -124,4 +127,46 @@ void DebugDialect::registerOps() {
 #define GET_OP_LIST
 #include "circt/Dialect/Debug/Debug.cpp.inc"
       >();
+}
+
+//===----------------------------------------------------------------------===//
+// EnumDefOp canonicalization
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct EnumDefDeduplication : public OpRewritePattern<EnumDefOp> {
+  using OpRewritePattern<EnumDefOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(EnumDefOp op,
+                                PatternRewriter &rewriter) const override {
+    // Equivalence requires fqn + variants + scope. Scope is load-bearing:
+    // same-fqn defs in different inline scopes share a source type but their
+    // result SSA tokens must not be merged.
+    auto *block = op->getBlock();
+    auto opFqn = op.getFqn();
+    auto opVariants = op.getVariantsMap();
+    auto opScope = op.getScope();
+
+    for (auto &otherOp : *block) {
+      if (&otherOp == op.getOperation())
+        break;
+      auto otherEnumDef = dyn_cast<EnumDefOp>(otherOp);
+      if (!otherEnumDef)
+        continue;
+
+      if (otherEnumDef.getFqn() == opFqn &&
+          otherEnumDef.getVariantsMap() == opVariants &&
+          otherEnumDef.getScope() == opScope) {
+        rewriter.replaceOp(op, otherEnumDef.getResult());
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+} // namespace
+
+void EnumDefOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                            MLIRContext *context) {
+  results.add<EnumDefDeduplication>(context);
 }

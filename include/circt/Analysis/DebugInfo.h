@@ -12,6 +12,7 @@
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 
 namespace circt {
@@ -22,6 +23,25 @@ struct DIVariable;
 namespace detail {
 struct DebugInfoBuilder;
 } // namespace detail
+
+/// Compact per-module integer identifier for a `dbg.enumdef` op, used by
+/// downstream exporters (e.g. HGLDD's `enum_def_ref`). Assigned by the DI
+/// analysis when it first encounters each enumdef in a module.
+using DIEnumDefId = uint32_t;
+
+/// Map from an enum's raw integer value to its variant name.
+using DIEnumValMap = SmallDenseMap<int64_t, StringAttr>;
+
+/// Module-scoped table of all enum definitions: id -> variant map.
+using DIEnumDefMap = SmallDenseMap<DIEnumDefId, DIEnumValMap>;
+
+/// Source-language type information lifted off `dbg.moduleinfo`,
+/// `dbg.variable`, and `dbg.subfield` ops. Mirrored into the HGLDD
+/// `source_lang_type_info` field for consumption by waveform viewers.
+struct DISourceLang {
+  StringAttr typeName;
+  ArrayAttr params;
+};
 
 struct DIModule {
   /// The operation that generated this level of hierarchy.
@@ -36,6 +56,19 @@ struct DIModule {
   bool isExtern = false;
   /// If this is an inline scope created by a `dbg.scope` operation.
   bool isInline = false;
+
+  /// Source-language type, from `dbg.moduleinfo`.
+  DISourceLang sourceLangType;
+
+  /// Enum definitions visible at this module's scope.
+  DIEnumDefMap enumDefinitions;
+
+  /// Maps each `debug::EnumDefOp` in this module to its compact numeric ID
+  /// (the one used as the key in `enumDefinitions`). Consumers that walk IR
+  /// and need the same ID (e.g. when emitting `enum_def_ref` references from
+  /// an arbitrary `dbg.enumdef` pointer) should look it up here instead of
+  /// assigning their own counter.
+  llvm::DenseMap<mlir::Operation *, DIEnumDefId> enumDefIds;
 };
 
 struct DIInstance {
@@ -54,6 +87,20 @@ struct DIVariable {
   LocationAttr loc;
   /// The SSA value representing the value of this variable.
   Value value = nullptr;
+  /// Enum definition this variable refers to, if any. Populated only for
+  /// scalar enum-typed variables (root `dbg.variable` has an `enumDef`
+  /// operand). For aggregates, per-leaf enum refs live on inner `dbg.subfield`
+  /// ops reachable via `value`; there is no lossy "pick one leaf" collapse.
+  mlir::Value enumDef = nullptr;
+
+  /// Source-language type, from `dbg.variable` attributes.
+  DISourceLang sourceLangType;
+
+  /// Reference to the enum definition by its per-module integer ID.
+  /// Populated when `enumDef` is non-null and points at a `dbg.enumdef` op
+  /// whose ID is registered in the enclosing `DIModule::enumDefinitions`
+  /// table.
+  std::optional<DIEnumDefId> enumDefRef = std::nullopt;
 };
 
 /// Debug information attached to an operation and the operations nested within.

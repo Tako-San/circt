@@ -128,7 +128,7 @@ struct BaseVisitor {
     paramName += param.name;
 
     debug::VariableOp::create(builder, loc, builder.getStringAttr(paramName),
-                              value, Value{});
+                              value, /*scope=*/Value{});
   }
 };
 } // namespace
