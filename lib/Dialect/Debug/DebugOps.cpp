@@ -9,6 +9,7 @@
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/StringSet.h"
 
 using namespace circt;
 using namespace debug;
@@ -169,4 +170,58 @@ struct EnumDefDeduplication : public OpRewritePattern<EnumDefOp> {
 void EnumDefOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
   results.add<EnumDefDeduplication>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// UHDI statement-tree reference check
+//===----------------------------------------------------------------------===//
+
+unsigned debug::verifyUhdiStatementRefs(Operation *root) {
+  unsigned diagnostics = 0;
+
+  // Walk each enclosing module (hw.module / firrtl.module / ...) that owns a
+  // dbg.rootblock; collect the set of dbg.variable names it declares, then
+  // walk the rootblock's statements and diagnose any unresolved refs.
+  root->walk([&](RootBlockOp rootBlock) {
+    Operation *enclosingModule = rootBlock->getParentOp();
+    if (!enclosingModule)
+      return;
+
+    llvm::StringSet<> knownNames;
+    enclosingModule->walk(
+        [&](VariableOp var) { knownNames.insert(var.getName()); });
+    // `dbg.expression` is a sibling value-tracker (used as the synthesised
+    // guardRef target for compound when-conditions); count its names too so
+    // a body's guardRef into a materialised expression doesn't fire a false
+    // positive.
+    enclosingModule->walk(
+        [&](ExpressionOp expr) { knownNames.insert(expr.getName()); });
+
+    auto checkRef =
+        [&](Operation *stmt, StringRef refKind, StringRef name) {
+          // `<complex>` is the well-known sentinel that capture-when emits when
+          // a guard expression can't be reduced to a single dbg.variable /
+          // dbg.expression name; treat it as expected, not a defect.
+          if (name.empty() || name == "<complex>" || knownNames.contains(name))
+            return;
+          stmt->emitWarning()
+              << "uhdi: statement " << refKind << " '" << name
+              << "' has no matching dbg.variable in the enclosing module; "
+                 "the emitter will fall back to the literal name";
+          ++diagnostics;
+        };
+
+    rootBlock.walk([&](Operation *op) {
+      if (auto c = dyn_cast<ConnectStmtOp>(op)) {
+        checkRef(op, "varRef", c.getVarRef());
+        checkRef(op, "valueRef", c.getValueRef());
+      } else if (auto b = dyn_cast<SubBlockOp>(op)) {
+        checkRef(op, "guardRef", b.getGuardRef());
+      } else if (auto d = dyn_cast<DeclStmtOp>(op)) {
+        checkRef(op, "varRef", d.getVarRef());
+      }
+    });
+  });
+
+  return diagnostics;
 }
