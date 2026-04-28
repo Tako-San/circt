@@ -281,20 +281,45 @@ static void emitConnectStmt(firrtl::FConnectLike connect, OpBuilder &b,
                             ArrayRef<GuardToken> stack) {
   std::string dest = nameFor(connect.getDest());
   std::string src = nameFor(connect.getSrc());
-  if (dest.empty() || src.empty()) {
-    // Skip connects whose sides aren't source-level-named. Most often this
-    // is a constant-driven connect or a temporary subexpression with no
-    // dbg.variable wrapper; the gap shows up as a missing entry in the
-    // statement tree downstream. Logged here so a regression that suddenly
-    // drops many connects is visible under -debug-only.
+  if (dest.empty()) {
+    // Anonymous LHS -- can't represent as an assignment to a
+    // named signal.  Drop and log under -debug-only.
     LLVM_DEBUG(llvm::dbgs()
-               << "uhdi: drop connect at " << connect.getLoc() << " (dest='"
-               << dest << "', src='" << src << "')\n");
+               << "uhdi: drop connect at " << connect.getLoc()
+               << " (dest='', src='" << src << "')\n");
     return;
   }
+  if (src.empty()) {
+    // Constant-driven (`connect r, UInt<8>(0)`) or driven by a
+    // temp-wire / subexpression result (`connect r, tail(...)`):
+    // there's no source-level dbg.variable to name.  Synthesise
+    // a placeholder so the connect still appears in the body --
+    // downstream hgdb-firrtl emits these as proper assignments
+    // and skipping them here means our debug.db loses a row per
+    // such connect (visible as `assignment` table divergence in
+    // bench).
+    src = "<const>";
+  }
+  // If the connect targets a regreset, the effective guard is
+  // `!<reset> && <existing user guards>` -- the reset has implicit
+  // priority and any user-written `r := ...` only fires when the
+  // reset signal is low.  hgdb-firrtl synthesises this implicit
+  // !reset by walking the FIRRTL graph; we make it explicit on
+  // the UHDI side so the .uhdi document carries the same semantic
+  // information and downstream converters reproduce the same
+  // breakpoint condition.
+  SmallVector<GuardToken> effectiveStack;
+  if (auto regreset = dyn_cast_or_null<firrtl::RegResetOp>(
+          connect.getDest().getDefiningOp())) {
+    std::string resetName = nameFor(regreset.getResetSignal());
+    if (!resetName.empty())
+      effectiveStack.push_back({resetName, /*negated=*/true});
+  }
+  effectiveStack.append(stack.begin(), stack.end());
+
   auto *ctx = b.getContext();
   NamedAttrList bp;
-  if (std::string e = serializeGuardStack(stack); !e.empty())
+  if (std::string e = serializeGuardStack(effectiveStack); !e.empty())
     bp.set("enableRef", StringAttr::get(ctx, e));
   debug::ConnectStmtOp::create(b, connect.getLoc(), StringAttr::get(ctx, dest),
                                StringAttr::get(ctx, src),
