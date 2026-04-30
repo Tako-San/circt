@@ -763,6 +763,8 @@ public:
 // Debug intrinsic converters
 //===----------------------------------------------------------------------===//
 
+static constexpr StringLiteral kDebugLeavesAttr = "firrtl.debug_leaves";
+
 static ArrayAttr parseParamsJSON(MLIRContext *ctx, StringAttr paramsStr,
                                  Operation *warnAt);
 
@@ -943,8 +945,8 @@ public:
       return true;
     return gi.namedParam("name") || gi.namedParam("typeName") ||
            gi.namedParam("params", /*optional=*/true) ||
-           gi.namedParam("enumFqn", /*optional=*/true) ||
-           gi.hasNParam(2, 3) || gi.hasNoOutput();
+           gi.namedParam("enumFqn", /*optional=*/true) || gi.hasNParam(2, 3) ||
+           gi.hasNoOutput();
   }
 
   void convert(GenericIntrinsic gi, GenericIntrinsicOpAdaptor adaptor,
@@ -958,9 +960,41 @@ public:
     if (auto paramAttr = gi.getParamValue<StringAttr>("params"))
       params = parseParamsJSON(rewriter.getContext(), paramAttr, gi.op);
 
-    // Index module-level dbg.enumdef ops once for both the var and its leaves.
+    // `liftDebugIntrinsics` resolved port/wire/reg/node refs into the operand
+    // list. Empty operands now means "unresolved" -> drop the intrinsic.
+    Value rawSignal;
+    if (!adaptor.getOperands().empty())
+      rawSignal = adaptor.getOperands()[0];
+    if (!rawSignal) {
+      rewriter.eraseOp(gi.op);
+      return;
+    }
+
+    StringRef varPath = varName ? varName.getValue() : StringRef{};
+
+    // Per-var leaves bucket: lift time grouped them by parent into a
+    // DictionaryAttr, so this is one O(1) lookup not an O(L) filter.
+    ArrayAttr varLeaves;
+    if (modOp && !varPath.empty())
+      if (auto leavesAttr =
+              modOp->getAttrOfType<DictionaryAttr>(kDebugLeavesAttr))
+        if (auto entry = leavesAttr.getNamed(varPath))
+          varLeaves = dyn_cast<ArrayAttr>(entry->getValue());
+
+    auto enumFqnAttr = gi.getParamValue<StringAttr>("enumFqn");
+    bool varHasEnum = enumFqnAttr && !enumFqnAttr.getValue().empty();
+    bool anyLeafEnum = false;
+    if (varLeaves)
+      for (auto e : varLeaves.getAsRange<DictionaryAttr>())
+        if (auto fqn = e.getAs<StringAttr>("enumFqn"))
+          if (!fqn.getValue().empty()) {
+            anyLeafEnum = true;
+            break;
+          }
+
+    // Index dbg.enumdef ops only when at least one ref needs them.
     llvm::StringMap<Value> enumDefByFqn;
-    if (modOp)
+    if (modOp && (varHasEnum || anyLeafEnum))
       modOp.walk([&](debug::EnumDefOp edOp) {
         enumDefByFqn.try_emplace(edOp.getFqn(), edOp.getResult());
       });
@@ -971,68 +1005,20 @@ public:
       return it == enumDefByFqn.end() ? Value{} : it->second;
     };
 
-    Value enumDef = lookupEnumDef(gi.getParamValue<StringAttr>("enumFqn"));
+    Value enumDef = lookupEnumDef(enumFqnAttr);
 
-    // Pick leaves belonging to this var from `firrtl.debug_leaves`, keyed by
-    // their display path (matches what buildDebugAggregateWithMeta reconstructs).
     LeafMetaMap leafMap;
-    StringRef varPath = varName ? varName.getValue() : StringRef{};
-    if (modOp && !varPath.empty()) {
-      auto leavesAttr = modOp->getAttrOfType<ArrayAttr>("firrtl.debug_leaves");
-      if (leavesAttr) {
-        for (auto entry : leavesAttr.getAsRange<DictionaryAttr>()) {
-          auto parentAttr = entry.getAs<StringAttr>("parent");
-          if (!parentAttr || parentAttr.getValue() != varPath)
-            continue;
-          auto pathAttr = entry.getAs<StringAttr>("name");
-          if (!pathAttr)
-            continue;
-          LeafMeta meta;
-          meta.typeName = entry.getAs<StringAttr>("typeName");
-          meta.params = entry.getAs<ArrayAttr>("params");
-          meta.enumDefVal = lookupEnumDef(entry.getAs<StringAttr>("enumFqn"));
-          leafMap[pathAttr.getValue()] = meta;
-        }
+    if (varLeaves)
+      for (auto entry : varLeaves.getAsRange<DictionaryAttr>()) {
+        auto pathAttr = entry.getAs<StringAttr>("name");
+        if (!pathAttr)
+          continue;
+        LeafMeta meta;
+        meta.typeName = entry.getAs<StringAttr>("typeName");
+        meta.params = entry.getAs<ArrayAttr>("params");
+        meta.enumDefVal = lookupEnumDef(entry.getAs<StringAttr>("enumFqn"));
+        leafMap[pathAttr.getValue()] = meta;
       }
-    }
-
-    // Locate the SSA to walk: direct operand, or (for non-passive roots
-    // emitted with 0 operands) a port/wire/reg named `varName`.
-    Value rawSignal;
-    if (!adaptor.getOperands().empty()) {
-      rawSignal = adaptor.getOperands()[0];
-    } else if (modOp && varName) {
-      StringRef wanted = varName.getValue();
-      for (auto [port, arg] :
-           llvm::zip(modOp.getPorts(), modOp.getArguments())) {
-        if (port.name.getValue() == wanted) {
-          rawSignal = arg;
-          break;
-        }
-      }
-      if (!rawSignal) {
-        modOp.walk([&](Operation *op) {
-          if (rawSignal)
-            return;
-          if (auto *namedOp = TypeSwitch<Operation *, Operation *>(op)
-                                  .Case<WireOp, NodeOp, RegOp, RegResetOp>(
-                                      [&](auto o) -> Operation * {
-                                        return o.getNameAttr().getValue() ==
-                                                       wanted
-                                                   ? op
-                                                   : nullptr;
-                                      })
-                                  .Default(nullptr))
-            rawSignal = namedOp->getResult(0);
-        });
-      }
-    }
-
-    if (!rawSignal) {
-      // Memory case (or unresolved): just erase the intrinsic.
-      rewriter.eraseOp(gi.op);
-      return;
-    }
 
     Value dbgValue = buildDebugAggregateWithMeta(rewriter, location, rawSignal,
                                                  varPath, leafMap);
@@ -1313,8 +1299,6 @@ void FIRRTLIntrinsicLoweringDialectInterface::populateIntrinsicLowerings(
   lowering.add<CirctDebugModuleInfoConverter>("circt_debug_moduleinfo");
 }
 
-static constexpr StringLiteral kDebugLeavesAttr = "firrtl.debug_leaves";
-
 namespace {
 
 /// Process one `circt_debug_enumdef` intrinsic: validate, parse variants,
@@ -1389,9 +1373,10 @@ LogicalResult processEnumDefIntrinsic(GenericIntrinsicOp op, FModuleOp mod,
 }
 
 /// Process one `circt_debug_subfield` intrinsic: validate parent/name
-/// invariant and append a leaf entry for `firrtl.debug_leaves`.
-LogicalResult processSubfieldIntrinsic(GenericIntrinsicOp op,
-                                       SmallVectorImpl<Attribute> &entries) {
+/// invariant and append a leaf entry to its parent's bucket.
+LogicalResult processSubfieldIntrinsic(
+    GenericIntrinsicOp op,
+    llvm::StringMap<SmallVector<Attribute>> &entriesByParent) {
   auto *ctx = op.getContext();
   GenericIntrinsic gi(op);
   auto nameAttr = gi.getParamValue<StringAttr>("name");
@@ -1417,7 +1402,6 @@ LogicalResult processSubfieldIntrinsic(GenericIntrinsicOp op,
 
   SmallVector<NamedAttribute> fields;
   fields.push_back({StringAttr::get(ctx, "name"), nameAttr});
-  fields.push_back({StringAttr::get(ctx, "parent"), parentAttr});
   if (auto tn = gi.getParamValue<StringAttr>("typeName"))
     fields.push_back({StringAttr::get(ctx, "typeName"), tn});
   if (auto fqn = gi.getParamValue<StringAttr>("enumFqn"))
@@ -1427,7 +1411,7 @@ LogicalResult processSubfieldIntrinsic(GenericIntrinsicOp op,
     if (auto params = parseParamsJSON(ctx, paramsStr, op))
       fields.push_back({StringAttr::get(ctx, "params"), params});
 
-  entries.push_back(DictionaryAttr::get(ctx, fields));
+  entriesByParent[parent].push_back(DictionaryAttr::get(ctx, fields));
   return success();
 }
 
@@ -1437,26 +1421,63 @@ namespace circt::firrtl {
 
 LogicalResult liftDebugIntrinsics(FModuleOp mod, OpBuilder &builder) {
   auto *ctx = mod.getContext();
-  llvm::StringMap<Value> seen;
-  SmallVector<Attribute> leafEntries;
+  llvm::StringMap<Value> enumDefByFqn;
+  llvm::StringMap<SmallVector<Attribute>> leavesByParent;
+  llvm::StringMap<Value> namedDecls;
   SmallVector<GenericIntrinsicOp> toErase;
+  SmallVector<GenericIntrinsicOp> debugVars;
   bool hadError = false;
 
-  mod.walk([&](GenericIntrinsicOp op) {
-    auto kind = op.getIntrinsic();
-    if (kind == "circt_debug_enumdef") {
-      toErase.push_back(op);
-      if (failed(processEnumDefIntrinsic(op, mod, builder, seen)))
-        hadError = true;
-    } else if (kind == "circt_debug_subfield") {
-      toErase.push_back(op);
-      if (failed(processSubfieldIntrinsic(op, leafEntries)))
-        hadError = true;
+  // Index ports up front; in-body decls are picked up during the walk.
+  for (auto [port, arg] : llvm::zip(mod.getPorts(), mod.getArguments()))
+    namedDecls.try_emplace(port.name.getValue(), arg);
+
+  mod.walk([&](Operation *op) {
+    if (auto giOp = dyn_cast<GenericIntrinsicOp>(op)) {
+      auto kind = giOp.getIntrinsic();
+      if (kind == "circt_debug_enumdef") {
+        toErase.push_back(giOp);
+        if (failed(processEnumDefIntrinsic(giOp, mod, builder, enumDefByFqn)))
+          hadError = true;
+      } else if (kind == "circt_debug_subfield") {
+        toErase.push_back(giOp);
+        if (failed(processSubfieldIntrinsic(giOp, leavesByParent)))
+          hadError = true;
+      } else if (kind == "circt_debug_var") {
+        debugVars.push_back(giOp);
+      }
+      return;
     }
+    TypeSwitch<Operation *>(op).Case<WireOp, NodeOp, RegOp, RegResetOp>(
+        [&](auto decl) {
+          namedDecls.try_emplace(decl.getNameAttr().getValue(),
+                                 decl.getResult());
+        });
   });
 
-  if (!leafEntries.empty())
-    mod->setAttr(kDebugLeavesAttr, ArrayAttr::get(ctx, leafEntries));
+  // Resolve circt_debug_var signal operands once: empty operand + named
+  // referent -> stamp the resolved Value, so the converter never re-walks.
+  for (auto giOp : debugVars) {
+    if (giOp.getNumOperands() != 0)
+      continue;
+    GenericIntrinsic gi(giOp);
+    auto varName = gi.getParamValue<StringAttr>("name");
+    if (!varName)
+      continue;
+    auto it = namedDecls.find(varName.getValue());
+    if (it == namedDecls.end())
+      continue;
+    giOp->setOperands(ValueRange{it->second});
+  }
+
+  if (!leavesByParent.empty()) {
+    SmallVector<NamedAttribute> grouped;
+    grouped.reserve(leavesByParent.size());
+    for (auto &kv : leavesByParent)
+      grouped.push_back(
+          {StringAttr::get(ctx, kv.first()), ArrayAttr::get(ctx, kv.second)});
+    mod->setAttr(kDebugLeavesAttr, DictionaryAttr::get(ctx, grouped));
+  }
   for (auto op : toErase)
     op.erase();
   return failure(hadError);

@@ -253,6 +253,33 @@ static cl::opt<bool> hglddOnlyExistingFileLocs(
     cl::desc("Only consider locations in files that exist on disk"),
     cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<bool> emitUHDI("emit-uhdi",
+                              cl::desc("Emit UHDI pool-based debug info"),
+                              cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<std::string>
+    uhdiSourcePrefix("uhdi-source-prefix",
+                     cl::desc("Prefix for source file paths in UHDI output"),
+                     cl::init(""), cl::value_desc("path"),
+                     cl::cat(mainCategory));
+
+static cl::opt<std::string>
+    uhdiOutputPrefix("uhdi-output-prefix",
+                     cl::desc("Prefix for output file paths in UHDI output"),
+                     cl::init(""), cl::value_desc("path"),
+                     cl::cat(mainCategory));
+
+static cl::opt<bool> uhdiOnlyExistingFileLocs(
+    "uhdi-only-existing-file-locs",
+    cl::desc("Only consider locations in files that exist on disk (UHDI)"),
+    cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<std::string>
+    uhdiOutputFile("uhdi-output-file",
+                   cl::desc("Write UHDI JSON to this file "
+                            "(default: companion next to the Verilog output)"),
+                   cl::init(""), cl::value_desc("path"), cl::cat(mainCategory));
+
 static cl::opt<bool>
     emitBytecode("emit-bytecode",
                  cl::desc("Emit bytecode when generating MLIR output"),
@@ -350,6 +377,28 @@ struct EmitHGLDDPass
   void runOnOperation() override {
     markAllAnalysesPreserved();
     if (failed(debug::emitHGLDD(getOperation(), os, getHGLDDOptions())))
+      return signalPassFailure();
+  }
+};
+
+static debug::EmitUHDIOptions getUHDIOptions() {
+  debug::EmitUHDIOptions opts;
+  opts.sourceFilePrefix = uhdiSourcePrefix;
+  opts.outputFilePrefix = uhdiOutputPrefix;
+  opts.onlyExistingFileLocs = uhdiOnlyExistingFileLocs;
+  return opts;
+}
+
+/// Wrapper pass to call the `emitUHDI` translation. Mirrors EmitHGLDDPass:
+/// holds a reference to a stream owned by the caller of `pm.addPass`, whose
+/// scope must outlive `pm.run`.
+struct EmitUHDIPass
+    : public PassWrapper<EmitUHDIPass, OperationPass<mlir::ModuleOp>> {
+  llvm::raw_ostream &os;
+  EmitUHDIPass(llvm::raw_ostream &os) : os(os) {}
+  void runOnOperation() override {
+    markAllAnalysesPreserved();
+    if (failed(debug::emitUHDI(getOperation(), os, getUHDIOptions())))
       return signalPassFailure();
   }
 };
@@ -529,15 +578,18 @@ static LogicalResult processBuffer(
         return failure();
   }
 
-  // If the user requested HGLDD debug info emission, enable Verilog location
-  // tracking.
-  if (emitHGLDD)
+  // If the user requested HGLDD or UHDI debug info emission, enable Verilog
+  // location tracking so the emitter has hdl_loc data to report.
+  if (emitHGLDD || emitUHDI)
     loweringOptions.emitVerilogLocations = true;
 
   // Load the emitter options from the command line. Command line options if
   // specified will override any module options.
   if (loweringOptions.toString() != LoweringOptions().toString())
     loweringOptions.setAsAttribute(module.get());
+
+  // Owns stream lifetime; EmitUHDIPass only holds a reference.
+  std::unique_ptr<llvm::raw_fd_ostream> uhdiStream;
 
   // Add passes specific to Verilog emission if we're going there.
   if (outputFormat == OutputVerilog || outputFormat == OutputSplitVerilog ||
@@ -553,6 +605,25 @@ static LogicalResult processBuffer(
         return failure();
       if (emitHGLDD)
         pm.addPass(std::make_unique<EmitHGLDDPass>((*outputFile)->os()));
+      if (emitUHDI) {
+        if (uhdiOutputFile.empty()) {
+          llvm::errs()
+              << "error: --emit-uhdi requires --uhdi-output-file=<path>\n";
+          return failure();
+        }
+        // The stream's local-scope lifetime here covers `pm.run` below; the
+        // pass only holds a reference, the stream is destroyed at function
+        // exit (no static / no leak).
+        std::error_code ec;
+        uhdiStream = std::make_unique<llvm::raw_fd_ostream>(
+            uhdiOutputFile.getValue(), ec, llvm::sys::fs::OF_None);
+        if (ec) {
+          llvm::errs() << "error: cannot open " << uhdiOutputFile
+                       << " for UHDI output: " << ec.message() << "\n";
+          return failure();
+        }
+        pm.addPass(std::make_unique<EmitUHDIPass>(*uhdiStream));
+      }
       break;
     case OutputSplitVerilog:
       if (failed(firtool::populateExportSplitVerilog(
@@ -929,8 +1000,10 @@ int main(int argc, char **argv) {
     context.setThreadPool(threadPool);
   }
 
-  // Get firtool options from cmdline
+  // Get firtool options from cmdline. The UHDI cl::opt lives in this tool,
+  // not lib/Firtool's clOptions, so wire it through manually.
   firtool::FirtoolOptions firtoolOptions;
+  firtoolOptions.setEnableUhdi(emitUHDI);
 
   // Do the guts of the firtool process.
   auto result = executeFirtool(context, firtoolOptions);

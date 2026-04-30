@@ -987,7 +987,11 @@ LogicalResult Inliner::inliningWalk(
     }
 
     // Limited support for region-containing operations.
-    if (!isa<LayerBlockOp, WhenOp, MatchOp>(source))
+    // The dbg.rootblock / dbg.subblock pair must survive inlining so the
+    // captured when/connect tree gets cloned under the caller's scope
+    // alongside the inlined ops.
+    if (!isa<LayerBlockOp, WhenOp, MatchOp, debug::RootBlockOp,
+             debug::SubBlockOp>(source))
       return source->emitError("unsupported operation '")
              << source->getName() << "' cannot be inlined";
 
