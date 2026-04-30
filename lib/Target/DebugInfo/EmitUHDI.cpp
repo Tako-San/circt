@@ -47,6 +47,83 @@ namespace {
 static constexpr StringRef kFormatVersion = "1.0";
 static constexpr StringRef kChiselRepr = "chisel";
 
+/// `dbg.subfield` is a transparent metadata wrapper (typeName / params /
+/// enumDef) around a leaf SSA value, materialised by LowerIntrinsics on
+/// circt_debug_subfield refs. For type interning, name resolution, and
+/// expression-pool emission we want to see through it to the underlying
+/// value (typically a flattened bundle port wire post-LowerTypes).
+static mlir::Value unwrapDbgSubField(mlir::Value v) {
+  while (auto opResult = dyn_cast<OpResult>(v))
+    if (auto sf = dyn_cast<debug::SubFieldOp>(opResult.getOwner()))
+      v = sf.getValue();
+    else
+      break;
+  return v;
+}
+
+/// LowerTypes flattens an aggregate port into individual ports plus a
+/// per-field wire that aliases the new flat port (so the original
+/// `firrtl.subfield(io, idx)` uses can be RAUWed to a single SSA value).
+/// After PrettifyVerilogNames the wire's `name` matches the port's name,
+/// but its `hw.verilogName` is renamed (e.g. `io_a_0`) to dodge the
+/// collision with the actual port. `sv::resolveVerilogName` returns the
+/// renamed wire identifier, which is *not* the canonical signal a
+/// VCD-bound wave consumer expects (and verilator's --trace may omit the
+/// alias wire entirely). Walk through the wire-aliasing pattern to
+/// recover the port name when one applies. Returns null if `value` is
+/// not a recognisable port-alias.
+static StringAttr resolvePortAliasName(mlir::Value value) {
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return {};
+  // Pre-ExportVerilog: hw.wire %port -> result. `getInput()` is the port.
+  if (auto hwWire = dyn_cast<hw::WireOp>(op))
+    if (auto ba = dyn_cast<BlockArgument>(hwWire.getInput()))
+      if (auto mod =
+              dyn_cast<hw::HWModuleOp>(ba.getOwner()->getParentOp()))
+        return mod.getInputNameAttr(ba.getArgNumber());
+  // Post-ExportVerilog: sv.read_inout %wire. Walk to the wire and
+  // inspect its sv.assign / hw.output uses for port-alias patterns.
+  Operation *wireOp = nullptr;
+  if (auto rio = dyn_cast<sv::ReadInOutOp>(op)) {
+    if (auto *def = rio.getInput().getDefiningOp())
+      if (isa<sv::WireOp, sv::LogicOp>(def))
+        wireOp = def;
+  } else if (isa<sv::WireOp, sv::LogicOp>(op)) {
+    wireOp = op;
+  }
+  if (!wireOp)
+    return {};
+  Value wireResult = wireOp->getResult(0);
+  // Input pattern: `sv.assign %wire, %port_block_arg`.
+  for (auto &use : wireResult.getUses()) {
+    auto assign = dyn_cast<sv::AssignOp>(use.getOwner());
+    if (!assign || use.getOperandNumber() != 0)
+      continue;
+    if (auto ba = dyn_cast<BlockArgument>(assign.getSrc()))
+      if (auto mod =
+              dyn_cast<hw::HWModuleOp>(ba.getOwner()->getParentOp()))
+        return mod.getInputNameAttr(ba.getArgNumber());
+  }
+  // Output pattern: `%r = sv.read_inout %wire; hw.output %r, ...`.
+  for (auto &use : wireResult.getUses())
+    if (auto rio = dyn_cast<sv::ReadInOutOp>(use.getOwner()))
+      for (auto &readUse : rio->getUses())
+        if (auto out = dyn_cast<hw::OutputOp>(readUse.getOwner()))
+          if (auto mod = out->getParentOfType<hw::HWModuleOp>())
+            return mod.getOutputNameAttr(readUse.getOperandNumber());
+  return {};
+}
+
+/// Combined leaf-name resolver: try the port-alias walk first (so bundle
+/// fields surface as `io_a` rather than the lowering-introduced
+/// `io_a_0`), then fall back to the standard SV-name resolver.
+static StringAttr resolveBundleFieldName(mlir::Value value) {
+  if (auto a = resolvePortAliasName(value))
+    return a;
+  return sv::resolveVerilogName(value);
+}
+
 //===----------------------------------------------------------------------===//
 // File table & locations
 //===----------------------------------------------------------------------===//
@@ -107,6 +184,7 @@ public:
   /// hint-derived id (e.g. "BundleTest_io_in") or a `struct_N`/`array_N`
   /// fallback.
   std::string internValueType(mlir::Value value, StringRef nameHint = {}) {
+    value = unwrapDbgSubField(value);
     if (auto opResult = dyn_cast<OpResult>(value)) {
       if (auto s = dyn_cast_or_null<debug::StructOp>(opResult.getOwner()))
         return internStruct(s, nameHint);
@@ -157,8 +235,13 @@ private:
       StringRef n = cast<StringAttr>(nameAttr).getValue();
       std::string childHint =
           nameHint.empty() ? std::string() : (nameHint + "_" + n).str();
-      std::string ft = internValueType(field, childHint);
-      bool flipped = isa<BlockArgument>(field);
+      // dbg.subfield wraps the leaf-value with metadata (typeName, params)
+      // — see through it for type interning AND for the BlockArgument check
+      // (otherwise an input port flowing through a SubFieldOp loses its
+      // `flipped` marker).
+      mlir::Value innerField = unwrapDbgSubField(field);
+      std::string ft = internValueType(innerField, childHint);
+      bool flipped = isa<BlockArgument>(innerField);
       key.append(n).append(1, ':').append(ft);
       if (flipped)
         key += '!';
@@ -298,6 +381,12 @@ public:
   /// `{exprRef: id}`. `leafNameFn` is the scalar-signal Verilog resolver.
   Object operandFor(mlir::Value value,
                     llvm::function_ref<StringAttr(mlir::Value)> leafNameFn) {
+    // Look through dbg.subfield: a transparent metadata wrapper added by
+    // LowerIntrinsics on circt_debug_subfield refs. Without this, the
+    // bundle-field operands of a `dbg.struct` post-LowerTypes resolve to
+    // empty sigNames (the SubFieldOp result has type !dbg.subfield, which
+    // sv::resolveVerilogName doesn't know).
+    value = unwrapDbgSubField(value);
     if (auto nameAttr = leafNameFn(value))
       return Object{{"sigName", nameAttr.getValue().str()}};
     auto opResult = dyn_cast<OpResult>(value);
@@ -488,7 +577,10 @@ static Object emitVariable(debug::VariableOp var, EmitState &s) {
   // as the DCE'd-/inlined fallback.
   Object verilog;
   bool haveValue = false;
-  auto leafName = [](mlir::Value v) { return sv::resolveVerilogName(v); };
+  // Bundle fields (the only place dbg.subfield surfaces) end up as
+  // wires aliasing flat module ports post-LowerTypes: prefer the port
+  // name over the lowering-introduced wire identifier.
+  auto leafName = [](mlir::Value v) { return resolveBundleFieldName(v); };
   bool isAggregate = isa_and_nonnull<debug::StructOp, debug::ArrayOp>(
       var.getValue().getDefiningOp());
 
@@ -614,10 +706,14 @@ static void indexStructFields(VarRefIndex &idx, StringRef parentName,
        llvm::zip(structOp.getNames(), structOp.getFields())) {
     StringRef fieldName = cast<StringAttr>(nameAttr).getValue();
     std::string path = (parentName + "." + fieldName).str();
-    if (auto vname = sv::resolveVerilogName(fieldVal)) {
+    // dbg.subfield wraps the leaf with metadata; unwrap so resolveVerilogName
+    // sees the underlying wire/port and the nested-struct check below picks
+    // up `dbg.subfield(dbg.struct ...)` shapes too.
+    mlir::Value innerField = unwrapDbgSubField(fieldVal);
+    if (auto vname = resolveBundleFieldName(innerField)) {
       idx.map.try_emplace(path, vname.getValue().str());
     }
-    if (auto *fieldDefOp = fieldVal.getDefiningOp())
+    if (auto *fieldDefOp = innerField.getDefiningOp())
       if (auto nested = dyn_cast<debug::StructOp>(fieldDefOp))
         indexStructFields(idx, path, nested);
   }
@@ -870,7 +966,7 @@ void UhdiEmitter::collect(mlir::ModuleOp top) {
       if (!id)
         return;
       Array operands;
-      auto leafName = [](mlir::Value v) { return sv::resolveVerilogName(v); };
+      auto leafName = [](mlir::Value v) { return resolveBundleFieldName(v); };
       for (auto operand : expr.getExprOperands())
         operands.push_back(s.exprs.operandFor(operand, leafName));
       s.exprs.insertEntry(id.getValue(),
